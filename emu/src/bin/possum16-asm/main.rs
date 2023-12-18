@@ -86,9 +86,13 @@ struct Asm<'a> {
     toks: Vec<Box<dyn TokStream>>,
     str_int: StrInterner<'a>,
     output: Box<dyn Write>,
-    pc: u16,
-    bss: u16,
+    pc: u32,
+    bss: u32,
+    pc_end: bool,
+    bss_end: bool,
     bss_mode: bool,
+    accum_16: bool,
+    index_16: bool,
     syms: Vec<(Label<'a>, i32)>,
     scope: Option<&'a str>,
     emit: bool,
@@ -105,7 +109,11 @@ impl<'a> Asm<'a> {
             output,
             pc: 0,
             bss: 0,
+            pc_end: false,
+            bss_end: false,
             bss_mode: false,
+            accum_16: false,
+            index_16: false,
             syms: Vec::new(),
             scope: None,
             emit: false,
@@ -119,10 +127,13 @@ impl<'a> Asm<'a> {
         self.toks.last_mut().unwrap().rewind()?;
         self.pc = 0;
         self.bss = 0;
+        self.pc_end = false;
+        self.bss_end = false;
         self.bss_mode = false;
+        self.accum_16 = false;
+        self.index_16 = false;
         self.scope = None;
         self.emit = true;
-
         Ok(())
     }
 
@@ -142,7 +153,7 @@ impl<'a> Asm<'a> {
                 }
                 self.eat();
                 let expr = self.expr()?;
-                self.set_pc(self.const_word(expr)?);
+                self.set_pc(self.const_long(expr)?);
                 self.eol()?;
                 continue;
             }
@@ -201,7 +212,7 @@ impl<'a> Asm<'a> {
                         continue;
                     }
                     // otherwise it is a pointer to the current PC
-                    self.syms[index].1 = self.pc() as u32 as i32;
+                    self.syms[index].1 = self.pc() as i32;
                 }
                 // if this isn't a mnemonic or directive, then its an error
                 if mne.is_none() && dir.is_none() {
@@ -212,17 +223,64 @@ impl<'a> Asm<'a> {
                         return Err(self.err("directive not allowed in BSS mode"));
                     }
                     // TODO: execute directive
+                    self.eol()?;
                     continue;
                 }
                 let mne = mne.unwrap();
-                // TODO: execute mnemonic
+                match self.peek()? {
+                    // imp
+                    Tok::NEWLINE => {
+                        let op = mne.1[Addr::IMP.into_index()];
+                        if op == ____ {
+                            // TODO: should I allow a special case of BRK with no args?
+                            return Err(self.err("expected operand"));
+                        }
+                        if self.emit {
+                            self.write(&[op])?;
+                        }
+                        self.add_pc(1)?;
+                        self.eol()?;
+                        continue;
+                    }
+                    // imm
+                    Tok::HASH => {
+                        self.eat();
+                        let op = mne.1[Addr::IMM.into_index()];
+                        if op == ____ {
+                            return Err(self.err("illegal address mode"));
+                        }
+                        self.write(&[op])?;
+                        self.add_pc(1)?;
+                        #[rustfmt::skip]
+                        let width = match mne.0 {
+                            Mne::ADC | Mne::AND | Mne::BIT | Mne::CMP | Mne::EOR | Mne::ORA | Mne::LDA | Mne::SBC
+                                => if self.accum_16 { 2 } else { 1 },
+                            Mne::CPX | Mne::CPY | Mne::LDX | Mne::LDY
+                                => if self.index_16 { 2 } else { 1 },
+                            _ => 1,
+                        };
+                        if self.emit {
+                            let expr = self.expr()?;
+                            if width == 1 {
+                                let byte = self.const_byte(expr)?;
+                                self.write(&[byte])?;
+                            } else {
+                                let word = self.const_word(expr)?;
+                                self.write(&word.to_le_bytes())?;
+                            }
+                        }
+                        self.add_pc(width)?;
+                        self.eol()?;
+                        continue;
+                    }
+                    _ => todo!(),
+                }
             }
-            self.eol()?;
         }
         Ok(())
     }
 
-    fn pc(&self) -> u16 {
+    fn pc(&self) -> u32 {
         if self.bss_mode {
             self.bss
         } else {
@@ -230,12 +288,21 @@ impl<'a> Asm<'a> {
         }
     }
 
-    fn set_pc(&mut self, val: u16) {
+    fn set_pc(&mut self, val: u32) {
         if self.bss_mode {
             self.bss = val;
         } else {
             self.pc = val;
         }
+    }
+
+    fn add_pc(&mut self, amt: u32) -> io::Result<()> {
+        let val = self.pc().wrapping_add(amt);
+        if (val < self.pc()) || (val > 0x01000000) {
+            return Err(self.err("PC overflow"));
+        }
+        self.set_pc(val);
+        Ok(())
     }
 
     fn err(&self, msg: &str) -> io::Error {
@@ -268,6 +335,10 @@ impl<'a> Asm<'a> {
         self.tok_mut().eat();
     }
 
+    fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.output.write_all(buf)
+    }
+
     fn tok(&self) -> &dyn TokStream {
         self.toks.last().unwrap().as_ref()
     }
@@ -296,6 +367,14 @@ impl<'a> Asm<'a> {
         expr.ok_or_else(|| self.err("expression cannot be resolved"))
     }
 
+    fn const_long(&self, expr: Option<i32>) -> io::Result<u32> {
+        let expr = self.const_expr(expr)?;
+        if (expr as u32) > 0x007FFFFFu32 {
+            return Err(self.err("expression too large to fit in word"));
+        }
+        Ok(expr as u32)
+    }
+
     fn const_word(&self, expr: Option<i32>) -> io::Result<u16> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > (u16::MAX as u32) {
@@ -312,9 +391,9 @@ impl<'a> Asm<'a> {
         Ok(expr as u8)
     }
 
-    fn const_short_branch(&self, expr: Option<i32>) -> io::Result<u8> {
+    fn const_branch(&self, expr: Option<i32>) -> io::Result<u8> {
         let expr = self.const_expr(expr)?;
-        let branch = expr - (self.pc() as u32 as i32);
+        let branch = expr - (self.pc() as i32);
         if (branch < (i8::MIN as i32)) || (branch > (i8::MAX as i32)) {
             return Err(self.err("branch distance too far"));
         }
@@ -323,7 +402,7 @@ impl<'a> Asm<'a> {
 
     fn const_long_branch(&self, expr: Option<i32>) -> io::Result<u16> {
         let expr = self.const_expr(expr)?;
-        let branch = expr - (self.pc() as u32 as i32);
+        let branch = expr - (self.pc() as i32);
         if (branch < (i16::MIN as i32)) || (branch > (i16::MAX as i32)) {
             return Err(self.err("branch distance too far"));
         }
@@ -357,6 +436,7 @@ impl<'a> Asm<'a> {
             Op::Unary(Tok::BANG) => self.values.push((rhs == 0) as i32),
             Op::Unary(Tok::LT) => self.values.push(((rhs as u32) & 0xFF) as i32),
             Op::Unary(Tok::GT) => self.values.push((((rhs as u32) & 0xFF00) >> 8) as i32),
+            Op::Unary(Tok::CARET) => self.values.push((((rhs as u32) & 0xFF0000) >> 16) as i32),
             Op::Binary(tok) => {
                 let lhs = self.values.pop().unwrap();
                 match tok {
@@ -402,7 +482,7 @@ impl<'a> Asm<'a> {
     fn expr(&mut self) -> io::Result<Option<i32>> {
         self.values.clear();
         self.operators.clear();
-        let mut seen_value = false;
+        let mut seen_val = false;
         let mut paren_depth = 0;
         let mut seen_unknown_label = false;
         loop {
@@ -410,19 +490,19 @@ impl<'a> Asm<'a> {
                 // star is multiply or the PC
                 Tok::STAR => {
                     self.eat();
-                    if !seen_value {
-                        self.values.push(self.pc() as u32 as i32);
-                        seen_value = true;
+                    if !seen_val {
+                        self.values.push(self.pc() as i32);
+                        seen_val = true;
                         continue;
                     }
                     self.expr_push_apply(Op::Binary(Tok::STAR));
-                    seen_value = false;
+                    seen_val = false;
                     continue;
                 }
                 // these are optionally unary
-                tok @ (Tok::PLUS | Tok::MINUS | Tok::LT | Tok::GT) => {
+                tok @ (Tok::PLUS | Tok::MINUS | Tok::CARET | Tok::LT | Tok::GT) => {
                     self.eat();
-                    if seen_value {
+                    if seen_val {
                         self.expr_push_apply(Op::Binary(tok));
                     } else {
                         self.expr_push_apply(Op::Unary(tok));
@@ -432,51 +512,41 @@ impl<'a> Asm<'a> {
                 // always unary
                 tok @ (Tok::BANG | Tok::TILDE) => {
                     self.eat();
-                    if !seen_value {
+                    if !seen_val {
                         return Err(self.err("expected value"));
                     }
                     self.expr_push_apply(Op::Unary(tok));
-                    seen_value = false;
+                    seen_val = false;
                     continue;
                 }
-                tok @ (Tok::CARET
-                | Tok::PIPE
-                | Tok::AND
-                | Tok::OR
-                | Tok::SOLIDUS
-                | Tok::MODULUS
-                | Tok::ASL
-                | Tok::ASR
-                | Tok::LSR
-                | Tok::LTE
-                | Tok::GTE
-                | Tok::EQ
-                | Tok::NEQ) => {
+                #[rustfmt::skip]
+                tok @ (Tok::PIPE | Tok::AND | Tok::OR | Tok::SOLIDUS | Tok::MODULUS | Tok::ASL
+                      | Tok::ASR | Tok::LSR | Tok::LTE | Tok::GTE | Tok::EQ | Tok::NEQ) => {
                     self.eat();
-                    if !seen_value {
+                    if !seen_val {
                         return Err(self.err("expected value"));
                     }
                     self.expr_push_apply(Op::Binary(tok));
-                    seen_value = false;
+                    seen_val = false;
                     continue;
                 }
                 Tok::NUM => {
                     self.eat();
-                    if seen_value {
+                    if seen_val {
                         return Err(self.err("expected operator"));
                     }
                     self.values.push(self.tok().num());
-                    seen_value = true;
+                    seen_val = true;
                     continue;
                 }
                 Tok::LPAREN => {
                     self.eat();
-                    if seen_value {
+                    if seen_val {
                         return Err(self.err("expected operator"));
                     }
                     paren_depth += 1;
                     self.operators.push(Op::Unary(Tok::LPAREN));
-                    seen_value = false;
+                    seen_val = false;
                     continue;
                 }
                 Tok::RPAREN => {
@@ -486,7 +556,7 @@ impl<'a> Asm<'a> {
                     }
                     self.eat();
                     paren_depth -= 1;
-                    if !seen_value {
+                    if !seen_val {
                         return Err(self.err("expected value"));
                     }
                     loop {
@@ -520,20 +590,20 @@ impl<'a> Asm<'a> {
                     };
                     if let Some(sym) = self.syms.iter().find(|sym| &sym.0 == &label).copied() {
                         self.eat();
-                        if seen_value {
+                        if seen_val {
                             return Err(self.err("expected operator"));
                         }
                         self.values.push(sym.1);
-                        seen_value = true;
+                        seen_val = true;
                         continue;
                     }
                     seen_unknown_label = true;
                     self.eat();
-                    if seen_value {
+                    if seen_val {
                         return Err(self.err("expected operator"));
                     }
                     self.values.push(1);
-                    seen_value = true;
+                    seen_val = true;
                     continue;
                 }
                 _ => break,
@@ -552,10 +622,11 @@ impl<'a> Asm<'a> {
     }
 }
 
-struct Addr(u8); // really u24
+struct Addr(u8);
 
 #[rustfmt::skip]
 impl Addr {
+    const IMP: Self = Self(0);  //
     const IMM: Self = Self(1);  // #$00
     const SR: Self = Self(2);   // $00,S
     const DP: Self = Self(3);   // $00
@@ -578,22 +649,73 @@ impl Addr {
     const REL: Self = Self(20); // ±$00
     const RLL: Self = Self(21); // ±$0000
     const BM: Self = Self(22);  // $00,$00
+
+    fn into_index(self) -> usize {
+        self.0 as usize
+    }
 }
 
+#[derive(PartialEq, Eq)]
 struct Mne(&'static str); // I really only newtype these to create namespaces
 
 impl Mne {
     const ADC: Self = Self("ADC");
+    const AND: Self = Self("AND");
+    const ASL: Self = Self("ASL");
+    const BCC: Self = Self("BCC");
+    const BCS: Self = Self("BCS");
+    const BEQ: Self = Self("BEQ");
+    const BIT: Self = Self("BIT");
+    const BMI: Self = Self("BMI");
+    const BNE: Self = Self("BNE");
+    const BPL: Self = Self("BPL");
+    const BRA: Self = Self("BRA");
+    const BRK: Self = Self("BRK");
+    const BRL: Self = Self("BRL");
+    const BVC: Self = Self("BVC");
+    const BVS: Self = Self("BVS");
+    const CLC: Self = Self("CLC");
+    const CLD: Self = Self("CLD");
+    const CLI: Self = Self("CLI");
+    const CLV: Self = Self("CLV");
+    const CMP: Self = Self("CMP");
+    const COP: Self = Self("COP");
+    const CPX: Self = Self("CPX");
+    const CPY: Self = Self("CPY");
+    const DEC: Self = Self("DEC");
+    const DEX: Self = Self("DEX");
+    const DEY: Self = Self("DEY");
+    const EOR: Self = Self("EOR");
+
+    const LDA: Self = Self("LDA");
+    const LDX: Self = Self("LDX");
+    const LDY: Self = Self("LDY");
+
+    const ORA: Self = Self("ORA");
+
+    const NOP: Self = Self("NOP");
+
+    const REP: Self = Self("REP");
+
+    const SBC: Self = Self("SBC");
+
+    const SEP: Self = Self("SEP");
+
     const WDC: Self = Self("WDC");
 }
 
 const ____: u8 = 0x42; // $42 (WDC) is reserved so we special-case it as a blank
 
 #[rustfmt::skip]
-const MNEMONICS: &[(Mne, &[u8; 22])] = &[
-    //           imm   sr    dp    dpx   dpy   idp   idx   idy   idl   ily   isy   abs   abx   aby   abl   alx   ind   iax   ial   rel   rll   bm
-    (Mne::WDC, &[____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
-    (Mne::ADC, &[0x69, 0x63, 0x65, 0x75, ____, 0x72, 0x61, 0x71, 0x67, 0x77, 0x73, 0x6D, 0x7D, 0x79, 0x6F, 0x7F, ____, ____, ____, ____, ____, ____]),
+const MNEMONICS: &[(Mne, &[u8; 23])] = &[
+    //           imp   imm   sr    dp    dpx   dpy   idp   idx   idy   idl   ily   isy   abs   abx   aby   abl   alx   ind   iax   ial   rel   rll   bm
+    (Mne::ADC, &[____, 0x69, 0x63, 0x65, 0x75, ____, 0x72, 0x61, 0x71, 0x67, 0x77, 0x73, 0x6D, 0x7D, 0x79, 0x6F, 0x7F, ____, ____, ____, ____, ____, ____]),
+
+    (Mne::BRK, &[____, 0x00, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
+
+    (Mne::NOP, &[0xEA, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
+
+    (Mne::WDC, &[____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
 ];
 
 struct Dir(&'static str);
@@ -622,6 +744,7 @@ impl Tok {
     const RPAREN: Self = Self(b')');
     const BANG: Self = Self(b'!');
     const TILDE: Self = Self(b'~');
+    const HASH: Self = Self(b'#');
 
     const EOF: Self = Self(0x80);
     const IDENT: Self = Self(0x81);

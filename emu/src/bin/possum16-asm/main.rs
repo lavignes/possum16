@@ -92,6 +92,9 @@ struct Asm<'a> {
     syms: Vec<(Label<'a>, i32)>,
     scope: Option<&'a str>,
     emit: bool,
+
+    values: Vec<i32>,
+    operators: Vec<Op>,
 }
 
 impl<'a> Asm<'a> {
@@ -106,6 +109,9 @@ impl<'a> Asm<'a> {
             syms: Vec::new(),
             scope: None,
             emit: false,
+
+            values: Vec::new(),
+            operators: Vec::new(),
         }
     }
 
@@ -116,6 +122,7 @@ impl<'a> Asm<'a> {
         self.bss_mode = false;
         self.scope = None;
         self.emit = true;
+
         Ok(())
     }
 
@@ -134,16 +141,17 @@ impl<'a> Asm<'a> {
                     return Err(self.err("expected EQU"));
                 }
                 self.eat();
-                self.set_pc(self.const_word(self.expr()?)?);
+                let expr = self.expr()?;
+                self.set_pc(self.const_word(expr)?);
                 self.eol()?;
                 continue;
             }
             if self.peek()? == Tok::IDENT {
-                // TODO: check if its an operator here and save which one
-                let is_op = false;
-
-                if !self.str_like("EQU") && !self.str_like("MAC") && !is_op {
-                    // set scope since label is no local
+                // is this a mnemonic
+                let mne = MNEMONICS.iter().find(|mne| mne.0 .0 == self.tok().str());
+                let dir = DIRECTIVES.iter().find(|dir| dir.0 .0 == self.tok().str());
+                if mne.is_none() && dir.is_none() && !self.str_like("EQU") && !self.str_like("MAC")
+                {
                     let string = self.str_intern();
                     let label = if !self.str().starts_with(".") {
                         self.scope.replace(string);
@@ -195,14 +203,19 @@ impl<'a> Asm<'a> {
                     // otherwise it is a pointer to the current PC
                     self.syms[index].1 = self.pc() as u32 as i32;
                 }
-                // if this isn't an op or pop, then its an error
-                if !is_op {
+                // if this isn't a mnemonic or directive, then its an error
+                if mne.is_none() && dir.is_none() {
                     return Err(self.err("unrecognized instruction"));
                 }
-                if self.bss_mode {
-                    // TODO: check table of valid ops for bss mode
+                if let Some((dir, allow_bss)) = dir {
+                    if self.bss_mode && !allow_bss {
+                        return Err(self.err("directive not allowed in BSS mode"));
+                    }
+                    // TODO: execute directive
+                    continue;
                 }
-                // TODO: execute op
+                let mne = mne.unwrap();
+                // TODO: execute mnemonic
             }
             self.eol()?;
         }
@@ -317,38 +330,320 @@ impl<'a> Asm<'a> {
         Ok(branch as i16 as u16)
     }
 
-    fn expr(&self) -> io::Result<Option<i32>> {
-        Ok(None)
+    fn expr_precedence(&self, op: Op) -> u8 {
+        match op {
+            Op::Unary(Tok::LPAREN) => 0xFF, // lparen is lowest precedence
+            Op::Unary(_) => 0,              // other unary is highest precedence
+            Op::Binary(Tok::SOLIDUS | Tok::MODULUS | Tok::STAR) => 1,
+            Op::Binary(Tok::PLUS | Tok::MINUS) => 2,
+            Op::Binary(Tok::ASL | Tok::ASR | Tok::LSR) => 3,
+            Op::Binary(Tok::LT | Tok::LTE | Tok::GT | Tok::GTE) => 4,
+            Op::Binary(Tok::EQ | Tok::NEQ) => 5,
+            Op::Binary(Tok::AMP) => 6,
+            Op::Binary(Tok::CARET) => 7,
+            Op::Binary(Tok::PIPE) => 8,
+            Op::Binary(Tok::AND) => 9,
+            Op::Binary(Tok::OR) => 10,
+            _ => unreachable!(),
+        }
+    }
+
+    fn expr_apply(&mut self, op: Op) {
+        let rhs = self.values.pop().unwrap();
+        match op {
+            Op::Unary(Tok::PLUS) => self.values.push(rhs),
+            Op::Unary(Tok::MINUS) => self.values.push(-rhs),
+            Op::Unary(Tok::TILDE) => self.values.push(!rhs),
+            Op::Unary(Tok::BANG) => self.values.push((rhs == 0) as i32),
+            Op::Unary(Tok::LT) => self.values.push(((rhs as u32) & 0xFF) as i32),
+            Op::Unary(Tok::GT) => self.values.push((((rhs as u32) & 0xFF00) >> 8) as i32),
+            Op::Binary(tok) => {
+                let lhs = self.values.pop().unwrap();
+                match tok {
+                    Tok::PLUS => self.values.push(lhs.wrapping_add(rhs)),
+                    Tok::MINUS => self.values.push(lhs.wrapping_sub(rhs)),
+                    Tok::STAR => self.values.push(lhs.wrapping_mul(rhs)),
+                    Tok::SOLIDUS => self.values.push(lhs.wrapping_div(rhs)),
+                    Tok::MODULUS => self.values.push(lhs.wrapping_rem(rhs)),
+                    Tok::ASL => self.values.push(lhs.wrapping_shl(rhs as u32)),
+                    Tok::ASR => self.values.push(lhs.wrapping_shr(rhs as u32)),
+                    Tok::LSR => self
+                        .values
+                        .push((lhs as u32).wrapping_shl(rhs as u32) as i32),
+                    Tok::LT => self.values.push((lhs < rhs) as i32),
+                    Tok::LTE => self.values.push((lhs <= rhs) as i32),
+                    Tok::GT => self.values.push((lhs > rhs) as i32),
+                    Tok::GTE => self.values.push((lhs >= rhs) as i32),
+                    Tok::EQ => self.values.push((lhs == rhs) as i32),
+                    Tok::NEQ => self.values.push((lhs != rhs) as i32),
+                    Tok::AMP => self.values.push(lhs & rhs),
+                    Tok::PIPE => self.values.push(lhs | rhs),
+                    Tok::CARET => self.values.push(lhs ^ rhs),
+                    Tok::AND => self.values.push(((lhs != 0) && (rhs != 0)) as i32),
+                    Tok::OR => self.values.push(((lhs != 0) || (rhs != 0)) as i32),
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn expr_push_apply(&mut self, op: Op) {
+        while let Some(top) = self.operators.last() {
+            if self.expr_precedence(*top) > self.expr_precedence(op) {
+                break;
+            }
+            self.expr_apply(*top);
+            self.operators.pop();
+        }
+        self.operators.push(op);
+    }
+
+    fn expr(&mut self) -> io::Result<Option<i32>> {
+        self.values.clear();
+        self.operators.clear();
+        let mut seen_value = false;
+        let mut paren_depth = 0;
+        let mut seen_unknown_label = false;
+        loop {
+            match self.peek()? {
+                // star is multiply or the PC
+                Tok::STAR => {
+                    self.eat();
+                    if !seen_value {
+                        self.values.push(self.pc() as u32 as i32);
+                        seen_value = true;
+                        continue;
+                    }
+                    self.expr_push_apply(Op::Binary(Tok::STAR));
+                    seen_value = false;
+                    continue;
+                }
+                // these are optionally unary
+                tok @ (Tok::PLUS | Tok::MINUS | Tok::LT | Tok::GT) => {
+                    self.eat();
+                    if seen_value {
+                        self.expr_push_apply(Op::Binary(tok));
+                    } else {
+                        self.expr_push_apply(Op::Unary(tok));
+                    }
+                    continue;
+                }
+                // always unary
+                tok @ (Tok::BANG | Tok::TILDE) => {
+                    self.eat();
+                    if !seen_value {
+                        return Err(self.err("expected value"));
+                    }
+                    self.expr_push_apply(Op::Unary(tok));
+                    seen_value = false;
+                    continue;
+                }
+                tok @ (Tok::CARET
+                | Tok::PIPE
+                | Tok::AND
+                | Tok::OR
+                | Tok::SOLIDUS
+                | Tok::MODULUS
+                | Tok::ASL
+                | Tok::ASR
+                | Tok::LSR
+                | Tok::LTE
+                | Tok::GTE
+                | Tok::EQ
+                | Tok::NEQ) => {
+                    self.eat();
+                    if !seen_value {
+                        return Err(self.err("expected value"));
+                    }
+                    self.expr_push_apply(Op::Binary(tok));
+                    seen_value = false;
+                    continue;
+                }
+                Tok::NUM => {
+                    self.eat();
+                    if seen_value {
+                        return Err(self.err("expected operator"));
+                    }
+                    self.values.push(self.tok().num());
+                    seen_value = true;
+                    continue;
+                }
+                Tok::LPAREN => {
+                    self.eat();
+                    if seen_value {
+                        return Err(self.err("expected operator"));
+                    }
+                    paren_depth += 1;
+                    self.operators.push(Op::Unary(Tok::LPAREN));
+                    seen_value = false;
+                    continue;
+                }
+                Tok::RPAREN => {
+                    // this pclose is probably part of the indirect address
+                    if self.operators.is_empty() && (paren_depth == 0) {
+                        break;
+                    }
+                    self.eat();
+                    paren_depth -= 1;
+                    if !seen_value {
+                        return Err(self.err("expected value"));
+                    }
+                    loop {
+                        if let Some(op) = self.operators.pop() {
+                            // we apply ops until we see the start of this grouping
+                            match op {
+                                Op::Binary(tok) | Op::Unary(tok) if tok == Tok::LPAREN => {
+                                    break;
+                                }
+                                _ => {}
+                            }
+                            self.expr_apply(op);
+                        } else {
+                            return Err(self.err("unbalanced parens"));
+                        }
+                    }
+                    continue;
+                }
+                Tok::IDENT => {
+                    let string = self.str_intern();
+                    let label = if !self.str().starts_with(".") {
+                        Label {
+                            scope: None,
+                            string,
+                        }
+                    } else {
+                        Label {
+                            scope: self.scope,
+                            string,
+                        }
+                    };
+                    if let Some(sym) = self.syms.iter().find(|sym| &sym.0 == &label).copied() {
+                        self.eat();
+                        if seen_value {
+                            return Err(self.err("expected operator"));
+                        }
+                        self.values.push(sym.1);
+                        seen_value = true;
+                        continue;
+                    }
+                    seen_unknown_label = true;
+                    self.eat();
+                    if seen_value {
+                        return Err(self.err("expected operator"));
+                    }
+                    self.values.push(1);
+                    seen_value = true;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        while let Some(top) = self.operators.pop() {
+            self.expr_apply(top);
+        }
+        if seen_unknown_label {
+            return Ok(None);
+        }
+        if let Some(value) = self.values.pop() {
+            return Ok(Some(value));
+        }
+        Err(self.err("expected value"))
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-struct Tok(u8); // I really only newtype this to create a namespace
+struct Addr(u8); // really u24
 
-impl Tok {
-    const NEWLINE: Self = Tok(b'\n');
-    const MODULUS: Self = Tok(b'%');
-    const STAR: Self = Tok(b'*');
-
-    const EOF: Self = Tok(0x80);
-    const IDENT: Self = Tok(0x81);
-    const NUM: Self = Tok(0x82);
-    const STR: Self = Tok(0x83);
-    const MACRO_ARG: Self = Tok(0x84);
-
-    const ASL: Self = Tok(0x85); // <<
-    const ASR: Self = Tok(0x85); // >>
-    const LTE: Self = Tok(0x87); // <=
-    const GTE: Self = Tok(0x88); // >=
-    const EQ: Self = Tok(0x89); // ==
-    const NEQ: Self = Tok(0x8A); // !=
-    const AND: Self = Tok(0x8B); // &&
-    const OR: Self = Tok(0x8C); // ||
+#[rustfmt::skip]
+impl Addr {
+    const IMM: Self = Self(1);  // #$00
+    const SR: Self = Self(2);   // $00,S
+    const DP: Self = Self(3);   // $00
+    const DPX: Self = Self(4);  // $00,X
+    const DPY: Self = Self(5);  // $00,Y
+    const IDP: Self = Self(6);  // ($00)
+    const IDX: Self = Self(7);  // ($00,X)
+    const IDY: Self = Self(8);  // ($00),Y
+    const IDL: Self = Self(9);  // [$00]
+    const ILY: Self = Self(10); // [$00],Y
+    const ISY: Self = Self(11); // ($00,S),Y
+    const ABS: Self = Self(12); // $0000
+    const ABX: Self = Self(13); // $0000,X
+    const ABY: Self = Self(14); // $0000,Y
+    const ABL: Self = Self(15); // $000000
+    const ALX: Self = Self(16); // $000000,X
+    const IND: Self = Self(17); // ($0000)
+    const IAX: Self = Self(18); // ($0000,X)
+    const IAL: Self = Self(19); // [$000000]
+    const REL: Self = Self(20); // ±$00
+    const RLL: Self = Self(21); // ±$0000
+    const BM: Self = Self(22);  // $00,$00
 }
 
-const TWO_CHAR_GRAPHEMES: &[(&[u8; 2], Tok)] = &[
+struct Mne(&'static str); // I really only newtype these to create namespaces
+
+impl Mne {
+    const ADC: Self = Self("ADC");
+    const WDC: Self = Self("WDC");
+}
+
+const ____: u8 = 0x42; // $42 (WDC) is reserved so we special-case it as a blank
+
+#[rustfmt::skip]
+const MNEMONICS: &[(Mne, &[u8; 22])] = &[
+    //           imm   sr    dp    dpx   dpy   idp   idx   idy   idl   ily   isy   abs   abx   aby   abl   alx   ind   iax   ial   rel   rll   bm
+    (Mne::WDC, &[____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
+    (Mne::ADC, &[0x69, 0x63, 0x65, 0x75, ____, 0x72, 0x61, 0x71, 0x67, 0x77, 0x73, 0x6D, 0x7D, 0x79, 0x6F, 0x7F, ____, ____, ____, ____, ____, ____]),
+];
+
+struct Dir(&'static str);
+
+impl Dir {}
+
+const DIRECTIVES: &[(Dir, bool)] = &[];
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct Tok(u8);
+
+#[rustfmt::skip]
+impl Tok {
+    const NEWLINE: Self = Self(b'\n');
+    const MODULUS: Self = Self(b'%');
+    const SOLIDUS: Self = Self(b'/');
+    const STAR: Self = Self(b'*');
+    const PLUS: Self = Self(b'+');
+    const MINUS: Self = Self(b'-');
+    const LT: Self = Self(b'<');
+    const GT: Self = Self(b'>');
+    const AMP: Self = Self(b'&');
+    const CARET: Self = Self(b'^');
+    const PIPE: Self = Self(b'|');
+    const LPAREN: Self = Self(b'(');
+    const RPAREN: Self = Self(b')');
+    const BANG: Self = Self(b'!');
+    const TILDE: Self = Self(b'~');
+
+    const EOF: Self = Self(0x80);
+    const IDENT: Self = Self(0x81);
+    const NUM: Self = Self(0x82);
+    const STR: Self = Self(0x83);
+    const ARG: Self = Self(0x84);
+
+    const ASL: Self = Self(0x85); // <<
+    const ASR: Self = Self(0x86); // >>
+    const LSR: Self = Self(0x87); // ~>
+    const LTE: Self = Self(0x88); // <=
+    const GTE: Self = Self(0x89); // >=
+    const EQ: Self = Self(0x8A);  // ==
+    const NEQ: Self = Self(0x8B); // !=
+    const AND: Self = Self(0x8C); // &&
+    const OR: Self = Self(0x8D);  // ||
+}
+
+const GRAPHEMES: &[(&[u8; 2], Tok)] = &[
     (b"<<", Tok::ASL),
     (b">>", Tok::ASR),
+    (b"~>", Tok::LSR),
     (b"<=", Tok::LTE),
     (b">=", Tok::GTE),
     (b"==", Tok::EQ),
@@ -356,6 +651,12 @@ const TWO_CHAR_GRAPHEMES: &[(&[u8; 2], Tok)] = &[
     (b"&&", Tok::AND),
     (b"||", Tok::OR),
 ];
+
+#[derive(Clone, Copy)]
+enum Op {
+    Binary(Tok),
+    Unary(Tok),
+}
 
 trait TokStream {
     fn err(&self, msg: &str) -> io::Error;
@@ -430,7 +731,7 @@ impl<'a> StrInterner<'a> {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Label<'a> {
     scope: Option<&'a str>,
     string: &'a str,
@@ -503,8 +804,8 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
                 }
                 self.number =
                     i32::from_str_radix(&self.string, 10).map_err(|e| self.err(&e.to_string()))?;
-                self.stash = Some(Tok::MACRO_ARG);
-                Ok(Tok::MACRO_ARG)
+                self.stash = Some(Tok::ARG);
+                Ok(Tok::ARG)
             }
             // number
             Some(c) if c.is_ascii_digit() || c == b'$' || c == b'%' => {
@@ -587,10 +888,10 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
                 if self.string.len() == 0 {
                     self.reader.eat();
                 }
-                // check for big symbol
+                // check for grapheme
                 if let Some(nc) = self.reader.peek()? {
                     let s = &[c, nc];
-                    if let Some(tok) = TWO_CHAR_GRAPHEMES
+                    if let Some(tok) = GRAPHEMES
                         .iter()
                         .find_map(|(bs, tok)| (*bs == s).then_some(tok))
                         .cloned()

@@ -176,7 +176,9 @@ impl<'a> Asm<'a> {
                             string,
                         }
                     };
-                    self.eat();
+                    self.eat(); // TODO: should go through code and only eat after
+                                // we check for possible errors to improve the errors
+                                // here we eat so the next error will report a bad location
                     let index = if let Some(item) = self
                         .syms
                         .iter()
@@ -227,31 +229,42 @@ impl<'a> Asm<'a> {
                     continue;
                 }
                 let mne = mne.unwrap();
-                match self.peek()? {
-                    // imp
-                    Tok::NEWLINE => {
-                        let op = mne.1[Addr::IMP.into_index()];
-                        if op == ____ {
-                            // TODO: should I allow a special case of BRK with no args?
-                            return Err(self.err("expected operand"));
-                        }
-                        if self.emit {
-                            self.write(&[op])?;
-                        }
-                        self.add_pc(1)?;
-                        self.eol()?;
-                        continue;
-                    }
-                    // imm
-                    Tok::HASH => {
-                        self.eat();
-                        let op = mne.1[Addr::IMM.into_index()];
-                        if op == ____ {
-                            return Err(self.err("illegal address mode"));
-                        }
-                        self.write(&[op])?;
-                        self.add_pc(1)?;
-                        #[rustfmt::skip]
+                let (addr, data) = self.operand()?;
+                let op = mne.1[addr.into_index()];
+                if op == ____ {
+                    return Err(self.err("illegal address mode"));
+                }
+                if self.emit {
+                    self.write(&op.to_le_bytes())?;
+                }
+                self.add_pc(1)?;
+                match addr {
+                    /*const IMP: Self = Self(0);  //
+                    const IMM: Self = Self(1);  // #$00
+                    const SR: Self = Self(2);   // $00,S
+                    const DP: Self = Self(3);   // $00
+                    const DPX: Self = Self(4);  // $00,X
+                    const DPY: Self = Self(5);  // $00,Y
+                    const IDP: Self = Self(6);  // ($00)
+                    const IDX: Self = Self(7);  // ($00,X)
+                    const IDY: Self = Self(8);  // ($00),Y
+                    const IDL: Self = Self(9);  // [$00]
+                    const ILY: Self = Self(10); // [$00],Y
+                    const ISY: Self = Self(11); // ($00,S),Y
+                    const ABS: Self = Self(12); // $0000
+                    const ABX: Self = Self(13); // $0000,X
+                    const ABY: Self = Self(14); // $0000,Y
+                    const ABL: Self = Self(15); // $000000
+                    const ALX: Self = Self(16); // $000000,X
+                    const IND: Self = Self(17); // ($0000)
+                    const IAX: Self = Self(18); // ($0000,X)
+                    const IAL: Self = Self(19); // [$000000]
+                    const REL: Self = Self(20); // ±$00
+                    const RLL: Self = Self(21); // ±$0000
+                    const BM: Self = Self(22);  // $00,$00*/
+                    Addr::IMP => {}
+                    Addr::IMM => {
+                        #[rustfmt::skip] // TODO: i hate this match
                         let width = match mne.0 {
                             Mne::ADC | Mne::AND | Mne::BIT | Mne::CMP | Mne::EOR | Mne::ORA | Mne::LDA | Mne::SBC
                                 => if self.accum_16 { 2 } else { 1 },
@@ -260,32 +273,24 @@ impl<'a> Asm<'a> {
                             _ => 1,
                         };
                         if self.emit {
-                            let expr = self.expr()?;
                             if width == 1 {
-                                let byte = self.const_byte(expr)?;
-                                self.write(&[byte])?;
+                                self.write(&self.const_byte(data)?.to_le_bytes())?;
                             } else {
-                                let word = self.const_word(expr)?;
-                                self.write(&word.to_le_bytes())?;
+                                self.write(&self.const_word(data)?.to_le_bytes())?;
                             }
                         }
                         self.add_pc(width)?;
-                        self.eol()?;
-                        continue;
                     }
-                    // some sort of indirect?
-                    Tok::LPAREN => {
-                        self.eat();
-                        let mut op = mne.1[Addr::
-                        self.eol()?;
-                        continue;
-                    }
-                    // some sort of long indirect?
-                    Tok::LBACKET => {
-
-                    }
-                    _ => todo!(),
+                    #[rustfmt::skip]
+                    Addr::SR | Addr::DP | Addr::DPX | Addr::DPY | Addr::IDP | Addr::IDX
+                    | Addr::IDY | Addr::ILY | Addr::ISY => {
+                        if self.emit {
+                            self.write(&self.const_byte(data)?.to_le_bytes())?;
+                        }
+                    },
                 }
+                self.eol()?;
+                continue;
             }
         }
         Ok(())
@@ -761,7 +766,7 @@ impl Tok {
     const LPAREN: Self = Self(b'(');
     const RPAREN: Self = Self(b')');
     const LBRACK: Self = Self(b'[');
-    const RBRACK Self = Self(b']');
+    const RBRACK: Self = Self(b']');
     const BANG: Self = Self(b'!');
     const TILDE: Self = Self(b'~');
     const HASH: Self = Self(b'#');

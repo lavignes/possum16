@@ -273,6 +273,17 @@ impl<'a> Asm<'a> {
                         self.eol()?;
                         continue;
                     }
+                    // some sort of indirect?
+                    Tok::LPAREN => {
+                        self.eat();
+                        let mut op = mne.1[Addr::
+                        self.eol()?;
+                        continue;
+                    }
+                    // some sort of long indirect?
+                    Tok::LBACKET => {
+
+                    }
                     _ => todo!(),
                 }
             }
@@ -624,6 +635,13 @@ impl<'a> Asm<'a> {
 
 struct Addr(u8);
 
+// todo: syntax for forcing abs and long addr modes:
+// |$00       abs
+// ||$000000  abl (might be best. its consistent)
+//
+// write a function that parses the operands into an addrmode with no context?
+// output the addrmode and an immediate I guess
+
 #[rustfmt::skip]
 impl Addr {
     const IMP: Self = Self(0);  //
@@ -742,6 +760,8 @@ impl Tok {
     const PIPE: Self = Self(b'|');
     const LPAREN: Self = Self(b'(');
     const RPAREN: Self = Self(b')');
+    const LBRACK: Self = Self(b'[');
+    const RBRACK Self = Self(b']');
     const BANG: Self = Self(b'!');
     const TILDE: Self = Self(b'~');
     const HASH: Self = Self(b'#');

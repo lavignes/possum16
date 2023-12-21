@@ -153,7 +153,7 @@ impl<'a> Asm<'a> {
                 }
                 self.eat();
                 let expr = self.expr()?;
-                self.set_pc(self.const_long(expr)?);
+                self.set_pc(self.const_24(expr)?);
                 self.eol()?;
                 continue;
             }
@@ -239,29 +239,6 @@ impl<'a> Asm<'a> {
                 }
                 self.add_pc(1)?;
                 match addr {
-                    /*const IMP: Self = Self(0);  //
-                    const IMM: Self = Self(1);  // #$00
-                    const SR: Self = Self(2);   // $00,S
-                    const DP: Self = Self(3);   // $00
-                    const DPX: Self = Self(4);  // $00,X
-                    const DPY: Self = Self(5);  // $00,Y
-                    const IDP: Self = Self(6);  // ($00)
-                    const IDX: Self = Self(7);  // ($00,X)
-                    const IDY: Self = Self(8);  // ($00),Y
-                    const IDL: Self = Self(9);  // [$00]
-                    const ILY: Self = Self(10); // [$00],Y
-                    const ISY: Self = Self(11); // ($00,S),Y
-                    const ABS: Self = Self(12); // $0000
-                    const ABX: Self = Self(13); // $0000,X
-                    const ABY: Self = Self(14); // $0000,Y
-                    const ABL: Self = Self(15); // $000000
-                    const ALX: Self = Self(16); // $000000,X
-                    const IND: Self = Self(17); // ($0000)
-                    const IAX: Self = Self(18); // ($0000,X)
-                    const IAL: Self = Self(19); // [$000000]
-                    const REL: Self = Self(20); // ±$00
-                    const RLL: Self = Self(21); // ±$0000
-                    const BM: Self = Self(22);  // $00,$00*/
                     Addr::IMP => {}
                     Addr::IMM => {
                         #[rustfmt::skip] // TODO: i hate this match
@@ -274,20 +251,53 @@ impl<'a> Asm<'a> {
                         };
                         if self.emit {
                             if width == 1 {
-                                self.write(&self.const_byte(data)?.to_le_bytes())?;
+                                self.write(&self.const_8(data)?.to_le_bytes())?;
                             } else {
-                                self.write(&self.const_word(data)?.to_le_bytes())?;
+                                self.write(&self.const_16(data)?.to_le_bytes())?;
                             }
                         }
                         self.add_pc(width)?;
                     }
                     #[rustfmt::skip]
                     Addr::SR | Addr::DP | Addr::DPX | Addr::DPY | Addr::IDP | Addr::IDX
-                    | Addr::IDY | Addr::ILY | Addr::ISY => {
+                    | Addr::IDY | Addr::IDL | Addr::ILY | Addr::ISY => {
                         if self.emit {
-                            self.write(&self.const_byte(data)?.to_le_bytes())?;
+                            self.write(&self.const_8(data)?.to_le_bytes())?;
                         }
-                    },
+                        self.add_pc(1)?;
+                    }
+                    Addr::ABS | Addr::ABX | Addr::ABY | Addr::IND | Addr::IAX => {
+                        if self.emit {
+                            self.write(&self.const_16(data)?.to_le_bytes())?;
+                        }
+                        self.add_pc(2)?;
+                    }
+                    Addr::ABL | Addr::ALX | Addr::IAL => {
+                        if self.emit {
+                            self.write(&self.const_24(data)?.to_le_bytes())?;
+                        }
+                        self.add_pc(3)?;
+                    }
+                    Addr::REL => {
+                        // TODO: auto-promote to RLL for BRA
+                        if self.emit {
+                            self.write(&self.const_branch_8(data)?.to_le_bytes())?;
+                        }
+                        self.add_pc(1)?;
+                    }
+                    Addr::RLL => {
+                        if self.emit {
+                            self.write(&self.const_branch_16(data)?.to_le_bytes())?;
+                        }
+                        self.add_pc(2)?;
+                    }
+                    Addr::BM => {
+                        if self.emit {
+                            self.write(&self.const_16(data)?.to_le_bytes())?;
+                        }
+                        self.add_pc(2)?;
+                    }
+                    _ => unreachable!(),
                 }
                 self.eol()?;
                 continue;
@@ -383,23 +393,23 @@ impl<'a> Asm<'a> {
         expr.ok_or_else(|| self.err("expression cannot be resolved"))
     }
 
-    fn const_long(&self, expr: Option<i32>) -> io::Result<u32> {
+    fn const_24(&self, expr: Option<i32>) -> io::Result<u32> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > 0x007FFFFFu32 {
-            return Err(self.err("expression too large to fit in word"));
+            return Err(self.err("expression too large to fit in 3 bytes"));
         }
         Ok(expr as u32)
     }
 
-    fn const_word(&self, expr: Option<i32>) -> io::Result<u16> {
+    fn const_16(&self, expr: Option<i32>) -> io::Result<u16> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > (u16::MAX as u32) {
-            return Err(self.err("expression too large to fit in word"));
+            return Err(self.err("expression too large to fit in 2 bytes"));
         }
         Ok(expr as u16)
     }
 
-    fn const_byte(&self, expr: Option<i32>) -> io::Result<u8> {
+    fn const_8(&self, expr: Option<i32>) -> io::Result<u8> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > (u8::MAX as u32) {
             return Err(self.err("expression too large to fit in byte"));
@@ -407,7 +417,7 @@ impl<'a> Asm<'a> {
         Ok(expr as u8)
     }
 
-    fn const_branch(&self, expr: Option<i32>) -> io::Result<u8> {
+    fn const_branch_8(&self, expr: Option<i32>) -> io::Result<u8> {
         let expr = self.const_expr(expr)?;
         let branch = expr - (self.pc() as i32);
         if (branch < (i8::MIN as i32)) || (branch > (i8::MAX as i32)) {
@@ -416,7 +426,7 @@ impl<'a> Asm<'a> {
         Ok(branch as i8 as u8)
     }
 
-    fn const_long_branch(&self, expr: Option<i32>) -> io::Result<u16> {
+    fn const_branch_16(&self, expr: Option<i32>) -> io::Result<u16> {
         let expr = self.const_expr(expr)?;
         let branch = expr - (self.pc() as i32);
         if (branch < (i16::MIN as i32)) || (branch > (i16::MAX as i32)) {
@@ -636,13 +646,44 @@ impl<'a> Asm<'a> {
         }
         Err(self.err("expected value"))
     }
+
+    fn operand(&mut self) -> io::Result<(Addr, Option<i32>)> {
+        match self.peek()? {
+            Tok::NEWLINE => {
+                self.eat();
+                Ok((Addr::IMP, None))
+            }
+            Tok::HASH => {
+                self.eat();
+                Ok((Addr::IMM, self.expr()?))
+            }
+            Tok::LPAREN => {
+                self.eat();
+                let width = match self.peek()? {
+                    Tok::PIPE => Width::ABS,
+                    Tok::ASP => Width::ABL,
+                    _ => Width::UNK,
+                };
+                let expr = self.expr()?;
+                if self.peek()? == Tok::RPAREN {}
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
+enum Width {
+    UNK,
+    ABS,
+    ABL,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Addr(u8);
 
 // todo: syntax for forcing abs and long addr modes:
 // |$00       abs
-// ||$000000  abl (might be best. its consistent)
+// @$000000   abl (xa assembler syntax)
 //
 // write a function that parses the operands into an addrmode with no context?
 // output the addrmode and an immediate I guess
@@ -661,17 +702,20 @@ impl Addr {
     const IDL: Self = Self(9);  // [$00]
     const ILY: Self = Self(10); // [$00],Y
     const ISY: Self = Self(11); // ($00,S),Y
-    const ABS: Self = Self(12); // $0000
-    const ABX: Self = Self(13); // $0000,X
-    const ABY: Self = Self(14); // $0000,Y
-    const ABL: Self = Self(15); // $000000
-    const ALX: Self = Self(16); // $000000,X
-    const IND: Self = Self(17); // ($0000)
-    const IAX: Self = Self(18); // ($0000,X)
-    const IAL: Self = Self(19); // [$000000]
+    const ABS: Self = Self(12); // |$0000
+    const ABX: Self = Self(13); // |$0000,X
+    const ABY: Self = Self(14); // |$0000,Y
+    const ABL: Self = Self(15); // @$000000
+    const ALX: Self = Self(16); // @$000000,X
+    const IND: Self = Self(17); // (|$0000)
+    const IAX: Self = Self(18); // (|$0000,X)
+    const IAL: Self = Self(19); // [@$000000]
     const REL: Self = Self(20); // ±$00
-    const RLL: Self = Self(21); // ±$0000
-    const BM: Self = Self(22);  // $00,$00
+    const RLL: Self = Self(21); // ±$0000   // TODO: should I remove this mode? its like IMM where I
+    const BM: Self = Self(22);  // $00,$00  // can determine the right one based on context? but
+                                            // not really, since the IMMs still use just 1 opcode.
+                                            // Keep the mode. But i dunno...... maybe i should go
+                                            // back to the possum2 impl
 
     fn into_index(self) -> usize {
         self.0 as usize
@@ -770,6 +814,8 @@ impl Tok {
     const BANG: Self = Self(b'!');
     const TILDE: Self = Self(b'~');
     const HASH: Self = Self(b'#');
+    const COMMA: Self = Self(b',');
+    const ASP: Self = Self(b'@');
 
     const EOF: Self = Self(0x80);
     const IDENT: Self = Self(0x81);

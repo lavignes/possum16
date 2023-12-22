@@ -228,77 +228,7 @@ impl<'a> Asm<'a> {
                     self.eol()?;
                     continue;
                 }
-                let mne = mne.unwrap();
-                let (addr, data) = self.operand()?;
-                let op = mne.1[addr.into_index()];
-                if op == ____ {
-                    return Err(self.err("illegal address mode"));
-                }
-                if self.emit {
-                    self.write(&op.to_le_bytes())?;
-                }
-                self.add_pc(1)?;
-                match addr {
-                    Addr::IMP => {}
-                    Addr::IMM => {
-                        #[rustfmt::skip] // TODO: i hate this match
-                        let width = match mne.0 {
-                            Mne::ADC | Mne::AND | Mne::BIT | Mne::CMP | Mne::EOR | Mne::ORA | Mne::LDA | Mne::SBC
-                                => if self.accum_16 { 2 } else { 1 },
-                            Mne::CPX | Mne::CPY | Mne::LDX | Mne::LDY
-                                => if self.index_16 { 2 } else { 1 },
-                            _ => 1,
-                        };
-                        if self.emit {
-                            if width == 1 {
-                                self.write(&self.const_8(data)?.to_le_bytes())?;
-                            } else {
-                                self.write(&self.const_16(data)?.to_le_bytes())?;
-                            }
-                        }
-                        self.add_pc(width)?;
-                    }
-                    #[rustfmt::skip]
-                    Addr::SR | Addr::DP | Addr::DPX | Addr::DPY | Addr::IDP | Addr::IDX
-                    | Addr::IDY | Addr::IDL | Addr::ILY | Addr::ISY => {
-                        if self.emit {
-                            self.write(&self.const_8(data)?.to_le_bytes())?;
-                        }
-                        self.add_pc(1)?;
-                    }
-                    Addr::ABS | Addr::ABX | Addr::ABY | Addr::IND | Addr::IAX => {
-                        if self.emit {
-                            self.write(&self.const_16(data)?.to_le_bytes())?;
-                        }
-                        self.add_pc(2)?;
-                    }
-                    Addr::ABL | Addr::ALX | Addr::IAL => {
-                        if self.emit {
-                            self.write(&self.const_24(data)?.to_le_bytes())?;
-                        }
-                        self.add_pc(3)?;
-                    }
-                    Addr::REL => {
-                        // TODO: auto-promote to RLL for BRA
-                        if self.emit {
-                            self.write(&self.const_branch_8(data)?.to_le_bytes())?;
-                        }
-                        self.add_pc(1)?;
-                    }
-                    Addr::RLL => {
-                        if self.emit {
-                            self.write(&self.const_branch_16(data)?.to_le_bytes())?;
-                        }
-                        self.add_pc(2)?;
-                    }
-                    Addr::BM => {
-                        if self.emit {
-                            self.write(&self.const_16(data)?.to_le_bytes())?;
-                        }
-                        self.add_pc(2)?;
-                    }
-                    _ => unreachable!(),
-                }
+                self.operand(mne.unwrap())?;
                 self.eol()?;
                 continue;
             }
@@ -647,26 +577,53 @@ impl<'a> Asm<'a> {
         Err(self.err("expected value"))
     }
 
-    fn operand(&mut self) -> io::Result<(Addr, Option<i32>)> {
+    fn find_opcode(&self, addrs: &[u8; 23], addr: Addr) -> Option<u8> {
+        let op = addrs[addr.0 as usize];
+        if op == ____ {
+            return None;
+        }
+        Some(op)
+    }
+
+    fn check_opcode(&self, addrs: &[u8; 23], addr: Addr) -> io::Result<u8> {
+        self.find_opcode(addrs, addr)
+            .ok_or_else(|| self.err("illegal address mode"))
+    }
+
+    fn operand(&mut self, mne: &(Mne, &[u8; 23])) -> io::Result<()> {
         match self.peek()? {
             Tok::NEWLINE => {
                 self.eat();
-                Ok((Addr::IMP, None))
+                let op = self.check_opcode(mne.1, Addr::IMP)?;
+                if self.emit {
+                    self.write(&[op])?;
+                }
+                self.add_pc(1)
             }
             Tok::HASH => {
                 self.eat();
-                Ok((Addr::IMM, self.expr()?))
-            }
-            Tok::LPAREN => {
-                self.eat();
-                let width = match self.peek()? {
-                    Tok::PIPE => Width::ABS,
-                    Tok::ASP => Width::ABL,
-                    _ => Width::UNK,
+                // TODO: I hate checking the mnemonic
+                #[rustfmt::skip]
+                let width = match mne.0 {
+                    Mne::ADC | Mne::AND | Mne::BIT | Mne::CMP | Mne::EOR | Mne::ORA | Mne::LDA | Mne::SBC
+                        => if self.accum_16 { 2 } else { 1 },
+                    Mne::CPX | Mne::CPY | Mne::LDX | Mne::LDY
+                        => if self.index_16 { 2 } else { 1 },
+                    _ => 1,
                 };
+                let op = self.check_opcode(mne.1, Addr::IMM)?;
                 let expr = self.expr()?;
-                if self.peek()? == Tok::RPAREN {}
+                if self.emit {
+                    self.write(&[op])?;
+                    if width == 1 {
+                        self.write(&self.const_8(expr)?.to_le_bytes())?;
+                    } else {
+                        self.write(&self.const_16(expr)?.to_le_bytes())?;
+                    }
+                }
+                self.add_pc(1 + width)
             }
+            Tok::LPAREN => {}
             _ => unreachable!(),
         }
     }
@@ -684,9 +641,6 @@ struct Addr(u8);
 // todo: syntax for forcing abs and long addr modes:
 // |$00       abs
 // @$000000   abl (xa assembler syntax)
-//
-// write a function that parses the operands into an addrmode with no context?
-// output the addrmode and an immediate I guess
 
 #[rustfmt::skip]
 impl Addr {
@@ -711,15 +665,8 @@ impl Addr {
     const IAX: Self = Self(18); // (|$0000,X)
     const IAL: Self = Self(19); // [@$000000]
     const REL: Self = Self(20); // ±$00
-    const RLL: Self = Self(21); // ±$0000   // TODO: should I remove this mode? its like IMM where I
-    const BM: Self = Self(22);  // $00,$00  // can determine the right one based on context? but
-                                            // not really, since the IMMs still use just 1 opcode.
-                                            // Keep the mode. But i dunno...... maybe i should go
-                                            // back to the possum2 impl
-
-    fn into_index(self) -> usize {
-        self.0 as usize
-    }
+    const RLL: Self = Self(21); // ±$0000
+    const BM: Self = Self(22);  // $00,$00
 }
 
 #[derive(PartialEq, Eq)]

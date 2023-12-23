@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{self, ErrorKind, Read, Seek, Write},
     marker::PhantomData,
+    mem,
     path::PathBuf,
     process::ExitCode,
     slice,
@@ -79,23 +80,48 @@ fn main_real() -> Result<(), Box<dyn Error>> {
     asm.pass()?;
     eprintln!("ok");
 
+    eprintln!("== stats ==");
+    eprintln!("symbols: {}", asm.syms.len());
+    eprintln!(
+        "string heap: {}/{} bytes",
+        asm.str_int
+            .storages
+            .iter()
+            .fold(0, |accum, storage| accum + storage.len()),
+        asm.str_int
+            .storages
+            .iter()
+            .fold(0, |accum, storage| accum + storage.capacity())
+    );
+    eprintln!(
+        "macro heap: {}/{} bytes",
+        asm.tok_int.storages.iter().fold(0, |accum, storage| accum
+            + (storage.len() * mem::size_of::<MacroTok>())),
+        asm.tok_int.storages.iter().fold(0, |accum, storage| accum
+            + (storage.capacity() * mem::size_of::<MacroTok>()))
+    );
+
     Ok(())
 }
 
 struct Asm<'a> {
-    toks: Vec<Box<dyn TokStream>>,
+    toks: Vec<Box<dyn TokStream + 'a>>,
     str_int: StrInterner<'a>,
+    tok_int: TokInterner<'a>,
     output: Box<dyn Write>,
     pc: u32,
-    bss: u32,
+    dat: u32,
     pc_end: bool,
-    bss_end: bool,
-    bss_mode: bool,
+    dat_end: bool,
+    dat_mode: bool,
     accum_16: bool,
     index_16: bool,
     syms: Vec<(Label<'a>, i32)>,
     scope: Option<&'a str>,
     emit: bool,
+    if_level: usize,
+
+    macros: Vec<Macro<'a>>,
 
     values: Vec<i32>,
     operators: Vec<Op>,
@@ -106,17 +132,21 @@ impl<'a> Asm<'a> {
         Self {
             toks: vec![Box::new(lexer)],
             str_int: StrInterner::new(),
+            tok_int: TokInterner::new(),
             output,
             pc: 0,
-            bss: 0,
+            dat: 0,
             pc_end: false,
-            bss_end: false,
-            bss_mode: false,
+            dat_end: false,
+            dat_mode: false,
             accum_16: false,
             index_16: false,
             syms: Vec::new(),
             scope: None,
             emit: false,
+            if_level: 0,
+
+            macros: Vec::new(),
 
             values: Vec::new(),
             operators: Vec::new(),
@@ -126,14 +156,16 @@ impl<'a> Asm<'a> {
     fn rewind(&mut self) -> io::Result<()> {
         self.toks.last_mut().unwrap().rewind()?;
         self.pc = 0;
-        self.bss = 0;
+        self.dat = 0;
         self.pc_end = false;
-        self.bss_end = false;
-        self.bss_mode = false;
+        self.dat_end = false;
+        self.dat_mode = false;
         self.accum_16 = false;
         self.index_16 = false;
         self.scope = None;
         self.emit = true;
+        self.if_level = 0;
+        self.macros.clear();
         Ok(())
     }
 
@@ -149,7 +181,7 @@ impl<'a> Asm<'a> {
             if self.peek()? == Tok::STAR {
                 self.eat();
                 if (self.peek()? != Tok::IDENT) && !self.str_like("EQU") {
-                    return Err(self.err("expected EQU"));
+                    return Err(self.err("expected equ"));
                 }
                 self.eat();
                 let expr = self.expr()?;
@@ -158,27 +190,66 @@ impl<'a> Asm<'a> {
                 continue;
             }
             if self.peek()? == Tok::IDENT {
-                // is this a mnemonic
-                let mne = MNEMONICS.iter().find(|mne| mne.0 .0 == self.tok().str());
-                let dir = DIRECTIVES.iter().find(|dir| dir.0 .0 == self.tok().str());
+                let mne = MNEMONICS.iter().find(|mne| self.str_like(mne.0 .0));
+                let dir = DIRECTIVES.iter().find(|dir| self.str_like(dir.0 .0));
+                // is this a label?
                 if mne.is_none() && dir.is_none() && !self.str_like("EQU") && !self.str_like("MAC")
                 {
+                    // is this a defined macro?
+                    if let Some(mac) = self
+                        .macros
+                        .iter()
+                        .find(|mac| self.str() == mac.name)
+                        .copied()
+                    {
+                        let line = self.tok().line();
+                        self.eat();
+                        let mut args = Vec::new();
+                        loop {
+                            match self.peek()? {
+                                Tok::NEWLINE | Tok::EOF => break,
+                                Tok::IDENT => args.push(MacroTok::Ident(self.str_intern())),
+                                Tok::STR => args.push(MacroTok::Str(self.str_intern())),
+                                Tok::NUM => args.push(MacroTok::Num(self.tok().num())),
+                                tok => args.push(MacroTok::Tok(tok)),
+                            }
+                            self.eat();
+                            if self.peek()? != Tok::COMMA {
+                                break;
+                            }
+                            self.eat();
+                        }
+                        self.eol()?;
+                        self.toks.push(Box::new(MacroInvocation {
+                            inner: mac,
+                            line,
+                            index: 0,
+                            args,
+                        }));
+                        continue;
+                    }
+
                     let string = self.str_intern();
                     let label = if !self.str().starts_with(".") {
                         self.scope.replace(string);
-                        Label {
-                            scope: None,
-                            string,
-                        }
+                        Label::new(None, string)
                     } else {
-                        Label {
-                            scope: self.scope,
-                            string,
-                        }
+                        Label::new(self.scope, string)
                     };
                     self.eat(); // TODO: should go through code and only eat after
                                 // we check for possible errors to improve the errors
                                 // here we eat so the next error will report a bad location
+
+                    // being defined to a macro?
+                    if (self.peek()? == Tok::IDENT) && self.str_like("MAC") {
+                        if label.string.starts_with(".") {
+                            return Err(self.err("macro names must be global"));
+                        }
+                        self.eat();
+                        self.macrodef(label)?;
+                        self.eol()?;
+                        continue;
+                    }
                     let index = if let Some(item) = self
                         .syms
                         .iter()
@@ -220,33 +291,36 @@ impl<'a> Asm<'a> {
                 if mne.is_none() && dir.is_none() {
                     return Err(self.err("unrecognized instruction"));
                 }
-                if let Some((dir, allow_bss)) = dir {
-                    if self.bss_mode && !allow_bss {
-                        return Err(self.err("directive not allowed in BSS mode"));
+                // is this a directive
+                if let Some((dir, allow_dat)) = dir {
+                    if self.dat_mode && !allow_dat {
+                        return Err(self.err("directive not allowed in dat mode"));
                     }
-                    // TODO: execute directive
+                    self.eat();
+                    self.directive(*dir)?;
                     self.eol()?;
                     continue;
                 }
+                // must be an mnemonic
+                self.eat();
                 self.operand(mne.unwrap())?;
-                self.eol()?;
-                continue;
             }
+            self.eol()?;
         }
         Ok(())
     }
 
     fn pc(&self) -> u32 {
-        if self.bss_mode {
-            self.bss
+        if self.dat_mode {
+            self.dat
         } else {
             self.pc
         }
     }
 
     fn set_pc(&mut self, val: u32) {
-        if self.bss_mode {
-            self.bss = val;
+        if self.dat_mode {
+            self.dat = val;
         } else {
             self.pc = val;
         }
@@ -255,7 +329,7 @@ impl<'a> Asm<'a> {
     fn add_pc(&mut self, amt: u32) -> io::Result<()> {
         let val = self.pc().wrapping_add(amt);
         if (val < self.pc()) || (val > 0x01000000) {
-            return Err(self.err("PC overflow"));
+            return Err(self.err("pc overflow"));
         }
         self.set_pc(val);
         Ok(())
@@ -293,6 +367,15 @@ impl<'a> Asm<'a> {
 
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         self.output.write_all(buf)
+    }
+
+    fn write_str(&mut self) -> io::Result<()> {
+        let Self {
+            ref mut output,
+            toks,
+            ..
+        } = self;
+        output.write_all(toks.last().unwrap().str().as_bytes())
     }
 
     fn tok(&self) -> &dyn TokStream {
@@ -342,27 +425,9 @@ impl<'a> Asm<'a> {
     fn const_8(&self, expr: Option<i32>) -> io::Result<u8> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > (u8::MAX as u32) {
-            return Err(self.err("expression too large to fit in byte"));
+            return Err(self.err("expression too large to fit in 1 byte"));
         }
         Ok(expr as u8)
-    }
-
-    fn const_branch_8(&self, expr: Option<i32>) -> io::Result<u8> {
-        let expr = self.const_expr(expr)?;
-        let branch = expr - (self.pc() as i32);
-        if (branch < (i8::MIN as i32)) || (branch > (i8::MAX as i32)) {
-            return Err(self.err("branch distance too far"));
-        }
-        Ok(branch as i8 as u8)
-    }
-
-    fn const_branch_16(&self, expr: Option<i32>) -> io::Result<u16> {
-        let expr = self.const_expr(expr)?;
-        let branch = expr - (self.pc() as i32);
-        if (branch < (i16::MIN as i32)) || (branch > (i16::MAX as i32)) {
-            return Err(self.err("branch distance too far"));
-        }
-        Ok(branch as i16 as u16)
     }
 
     fn expr_precedence(&self, op: Op) -> u8 {
@@ -506,7 +571,7 @@ impl<'a> Asm<'a> {
                     continue;
                 }
                 Tok::RPAREN => {
-                    // this pclose is probably part of the indirect address
+                    // this rparen is probably part of the indirect address
                     if self.operators.is_empty() && (paren_depth == 0) {
                         break;
                     }
@@ -534,15 +599,9 @@ impl<'a> Asm<'a> {
                 Tok::IDENT => {
                     let string = self.str_intern();
                     let label = if !self.str().starts_with(".") {
-                        Label {
-                            scope: None,
-                            string,
-                        }
+                        Label::new(None, string)
                     } else {
-                        Label {
-                            scope: self.scope,
-                            string,
-                        }
+                        Label::new(self.scope, string)
                     };
                     if let Some(sym) = self.syms.iter().find(|sym| &sym.0 == &label).copied() {
                         self.eat();
@@ -590,6 +649,14 @@ impl<'a> Asm<'a> {
             .ok_or_else(|| self.err("illegal address mode"))
     }
 
+    fn expect(&mut self, tok: Tok) -> io::Result<()> {
+        if self.peek()? != tok {
+            return Err(self.err("unexpected garbage"));
+        }
+        self.eat();
+        Ok(())
+    }
+
     fn operand(&mut self, mne: &(Mne, &[u8; 23])) -> io::Result<()> {
         match self.peek()? {
             Tok::NEWLINE => {
@@ -603,6 +670,7 @@ impl<'a> Asm<'a> {
             Tok::HASH => {
                 self.eat();
                 // TODO: I hate checking the mnemonic
+                // could use a table instead
                 #[rustfmt::skip]
                 let width = match mne.0 {
                     Mne::ADC | Mne::AND | Mne::BIT | Mne::CMP | Mne::EOR | Mne::ORA | Mne::LDA | Mne::SBC
@@ -623,24 +691,402 @@ impl<'a> Asm<'a> {
                 }
                 self.add_pc(1 + width)
             }
-            Tok::LPAREN => {}
+            Tok::LPAREN => {
+                self.eat();
+                let expr = self.expr()?;
+                // TODO: hate, but it makes it easy to know whether its an IAB or IAX
+                if let Mne::JMP | Mne::JSR = mne.0 {
+                    let op = if self.peek()? == Tok::COMMA {
+                        self.eat();
+                        self.expect(Tok::X)?;
+                        self.check_opcode(mne.1, Addr::IAX)?
+                    } else {
+                        self.check_opcode(mne.1, Addr::IAB)?
+                    };
+                    self.expect(Tok::RPAREN)?;
+                    if self.emit {
+                        self.write(&[op])?;
+                        self.write(&self.const_16(expr)?.to_le_bytes())?;
+                    }
+                    return self.add_pc(3);
+                }
+                // IDX or ISY
+                if self.peek()? == Tok::COMMA {
+                    self.eat();
+                    let op = if self.peek()? == Tok::S {
+                        self.eat();
+                        self.expect(Tok::COMMA)?;
+                        self.expect(Tok::Y)?;
+                        self.check_opcode(mne.1, Addr::ISY)?
+                    } else {
+                        self.expect(Tok::COMMA)?;
+                        self.expect(Tok::X)?;
+                        self.check_opcode(mne.1, Addr::IDX)?
+                    };
+                    self.expect(Tok::RPAREN)?;
+                    if self.emit {
+                        self.write(&[op])?;
+                        self.write(&self.const_8(expr)?.to_le_bytes())?;
+                    }
+                    return self.add_pc(2);
+                }
+                self.expect(Tok::RPAREN)?;
+                // IDP or IDY
+                let op = if self.peek()? == Tok::COMMA {
+                    self.eat();
+                    self.expect(Tok::Y)?;
+                    self.check_opcode(mne.1, Addr::IDY)?
+                } else {
+                    self.check_opcode(mne.1, Addr::IDP)?
+                };
+                if self.emit {
+                    self.write(&[op])?;
+                    self.write(&self.const_8(expr)?.to_le_bytes())?;
+                }
+                self.add_pc(2)
+            }
+            Tok::LBRACK => {
+                self.eat();
+                let expr = self.expr()?;
+                // TODO: hate, but it makes it easy to know whether its an IAL
+                if mne.0 == Mne::JML {
+                    self.expect(Tok::RBRACK)?;
+                    if self.emit {
+                        self.write(&self.check_opcode(mne.1, Addr::IAL)?.to_le_bytes())?;
+                        self.write(&self.const_16(expr)?.to_le_bytes())?;
+                    }
+                    return self.add_pc(3);
+                }
+                self.expect(Tok::RBRACK)?;
+                // IDL or ILY
+                let op = if self.peek()? == Tok::COMMA {
+                    self.eat();
+                    self.expect(Tok::Y)?;
+                    self.check_opcode(mne.1, Addr::ILY)?
+                } else {
+                    self.check_opcode(mne.1, Addr::IDL)?
+                };
+                if self.emit {
+                    self.write(&[op])?;
+                    self.write(&self.const_8(expr)?.to_le_bytes())?;
+                }
+                self.add_pc(2)
+            }
+            _ => {
+                if let Some(op) = self.find_opcode(mne.1, Addr::REL) {
+                    let expr = self.expr()?;
+                    if self.emit {
+                        let branch = (self.pc() as i32) + self.const_expr(expr)?;
+                        if (branch < (i8::MIN as i32)) || (branch > (i8::MAX as i32)) {
+                            return Err(self.err("branch distance too far"));
+                        }
+                        self.write(&[op])?;
+                        self.write(&(branch as i8).to_le_bytes())?;
+                    }
+                    return self.add_pc(2);
+                }
+                if let Some(op) = self.find_opcode(mne.1, Addr::RLL) {
+                    let expr = self.expr()?;
+                    if self.emit {
+                        let branch = (self.pc() as i32) + self.const_expr(expr)?;
+                        if (branch < (i16::MIN as i32)) || (branch > (i16::MAX as i32)) {
+                            return Err(self.err("branch distance too far"));
+                        }
+                        self.write(&[op])?;
+                        self.write(&(branch as i16).to_le_bytes())?;
+                    }
+                    return self.add_pc(3);
+                }
+                if let Some(op) = self.find_opcode(mne.1, Addr::BM) {
+                    let src = self.expr()?;
+                    self.expect(Tok::COMMA)?;
+                    let dst = self.expr()?;
+                    if self.emit {
+                        self.write(&[op])?;
+                        self.write(&self.const_8(src)?.to_le_bytes())?;
+                        self.write(&self.const_8(dst)?.to_le_bytes())?;
+                    }
+                    return self.add_pc(3);
+                }
+                let width = match self.peek()? {
+                    Tok::PIPE => Width::ABS,
+                    Tok::ASP => Width::ABL,
+                    _ => Width::DP,
+                };
+                let expr = self.expr()?;
+                match (width, self.peek()?) {
+                    // SR, DPX, DPY
+                    (Width::DP, Tok::COMMA) => {
+                        self.eat();
+                        match self.peek()? {
+                            Tok::S => {
+                                self.eat();
+                                if self.emit {
+                                    self.write(&self.check_opcode(mne.1, Addr::SR)?.to_le_bytes())?;
+                                    self.write(&self.const_8(expr)?.to_le_bytes())?;
+                                }
+                                self.add_pc(2)
+                            }
+                            Tok::X => {
+                                self.eat();
+                                if self.emit {
+                                    self.write(
+                                        &self.check_opcode(mne.1, Addr::DPX)?.to_le_bytes(),
+                                    )?;
+                                    self.write(&self.const_8(expr)?.to_le_bytes())?;
+                                }
+                                self.add_pc(2)
+                            }
+                            Tok::Y => {
+                                self.eat();
+                                if self.emit {
+                                    self.write(
+                                        &self.check_opcode(mne.1, Addr::DPY)?.to_le_bytes(),
+                                    )?;
+                                    self.write(&self.const_8(expr)?.to_le_bytes())?;
+                                }
+                                self.add_pc(2)
+                            }
+                            _ => Err(self.err("illegal address mode")),
+                        }
+                    }
+                    // DP
+                    (Width::DP, _) => {
+                        self.eat();
+                        if self.emit {
+                            self.write(&self.check_opcode(mne.1, Addr::DP)?.to_le_bytes())?;
+                            self.write(&self.const_8(expr)?.to_le_bytes())?;
+                        }
+                        self.add_pc(2)
+                    }
+                    // ABX or ABY
+                    (Width::ABS, Tok::COMMA) => {
+                        self.eat();
+                        match self.peek()? {
+                            Tok::X => {
+                                self.eat();
+                                if self.emit {
+                                    self.write(
+                                        &self.check_opcode(mne.1, Addr::ABX)?.to_le_bytes(),
+                                    )?;
+                                    self.write(&self.const_16(expr)?.to_le_bytes())?;
+                                }
+                                self.add_pc(3)
+                            }
+                            Tok::Y => {
+                                self.eat();
+                                if self.emit {
+                                    self.write(
+                                        &self.check_opcode(mne.1, Addr::ABY)?.to_le_bytes(),
+                                    )?;
+                                    self.write(&self.const_16(expr)?.to_le_bytes())?;
+                                }
+                                self.add_pc(3)
+                            }
+                            _ => Err(self.err("illegal address mode")),
+                        }
+                    }
+                    // ABS
+                    (Width::ABS, _) => {
+                        self.eat();
+                        if self.emit {
+                            self.write(&self.check_opcode(mne.1, Addr::ABS)?.to_le_bytes())?;
+                            self.write(&self.const_16(expr)?.to_le_bytes())?;
+                        }
+                        self.add_pc(3)
+                    }
+                    // ALX
+                    (Width::ABL, Tok::X) => {
+                        self.eat();
+                        if self.emit {
+                            self.write(&self.check_opcode(mne.1, Addr::ALX)?.to_le_bytes())?;
+                            self.write(&self.const_16(expr)?.to_le_bytes())?;
+                        }
+                        self.add_pc(3)
+                    }
+                    // ALX
+                    (Width::ABL, _) => {
+                        self.eat();
+                        if self.emit {
+                            self.write(&self.check_opcode(mne.1, Addr::ABL)?.to_le_bytes())?;
+                            self.write(&self.const_24(expr)?.to_le_bytes())?;
+                        }
+                        self.add_pc(4)
+                    }
+                }
+            }
+        }
+    }
+
+    fn directive(&mut self, dir: Dir) -> io::Result<()> {
+        match dir {
+            Dir::BYT => loop {
+                if self.peek()? == Tok::STR {
+                    if self.emit {
+                        self.write_str()?;
+                    }
+                    self.add_pc(self.str().len() as u32)?;
+                    self.eat();
+                } else {
+                    let expr = self.expr()?;
+                    if self.emit {
+                        self.write(&self.const_8(expr)?.to_le_bytes())?;
+                    }
+                    self.add_pc(1)?;
+                }
+                if self.peek()? != Tok::COMMA {
+                    break;
+                }
+                self.eat();
+            },
+            Dir::WRD => loop {
+                let expr = self.expr()?;
+                if self.emit {
+                    self.write(&self.const_16(expr)?.to_le_bytes())?;
+                }
+                self.add_pc(2)?;
+                if self.peek()? != Tok::COMMA {
+                    break;
+                }
+                self.eat();
+            },
+            Dir::DAT => {
+                self.dat_mode = true;
+            }
+            Dir::PRG => {
+                self.dat_mode = false;
+            }
+            Dir::PAD => {
+                let expr = self.expr()?;
+                let pad = self.const_24(expr)?;
+                if self.emit && !self.dat_mode {
+                    for _ in 0..pad {
+                        self.write(&[0])?;
+                    }
+                }
+                self.add_pc(pad)?;
+            }
+            Dir::ADJ => {
+                let expr = self.expr()?;
+                let adj = self.pc() % self.const_24(expr)?;
+                if self.emit {
+                    for _ in 0..adj {
+                        self.write(&[0])?;
+                    }
+                }
+                self.add_pc(adj)?;
+            }
+            Dir::INS => {
+                if self.peek()? != Tok::STR {
+                    return Err(self.err("expected file name"));
+                }
+                let file = File::open(self.str())?;
+                self.eat();
+                let lexer = Lexer::new(file);
+                self.toks.push(Box::new(lexer));
+            }
+            Dir::IFF | Dir::IFD | Dir::IFN => {
+                let expr = self.expr()?;
+                let skip = match dir {
+                    Dir::IFF => self.const_expr(expr)? == 0,
+                    Dir::IFD => expr.is_none(),
+                    Dir::IFN => expr.is_some(),
+                    _ => unreachable!(),
+                };
+                if skip {
+                    let mut if_level = 0;
+                    loop {
+                        if self.peek()? == Tok::IDENT {
+                            if self.str_like(Dir::IFF.0)
+                                || self.str_like(Dir::IFD.0)
+                                || self.str_like(Dir::IFN.0)
+                                || self.str_like("MAC")
+                            {
+                                if_level += 1;
+                            } else if self.str_like(Dir::END.0) {
+                                if if_level == 0 {
+                                    self.eat();
+                                    return Ok(());
+                                }
+                                if_level -= 1;
+                            }
+                        }
+                        self.eat();
+                    }
+                }
+                self.if_level += 1;
+            }
+            Dir::END => {
+                if self.if_level == 0 {
+                    return Err(self.err("unexpected end"));
+                }
+                self.if_level -= 1;
+            }
+            Dir::IBT => {
+                self.index_16 = false;
+            }
+            Dir::IWD => {
+                self.index_16 = true;
+            }
+            Dir::ABT => {
+                self.accum_16 = false;
+            }
+            Dir::AWD => {
+                self.accum_16 = true;
+            }
             _ => unreachable!(),
         }
+        Ok(())
+    }
+
+    fn macrodef(&mut self, label: Label<'a>) -> io::Result<()> {
+        self.eol()?;
+        let mut toks = Vec::new();
+        let mut if_level = 0;
+        loop {
+            if self.peek()? == Tok::IDENT {
+                if self.str_like(Dir::IFF.0)
+                    || self.str_like(Dir::IFD.0)
+                    || self.str_like(Dir::IFN.0)
+                    || self.str_like("MAC")
+                {
+                    if_level += 1;
+                } else if self.str_like(Dir::END.0) {
+                    if if_level == 0 {
+                        self.eat();
+                        toks.push(MacroTok::Tok(Tok::EOF));
+                        break;
+                    }
+                    if_level -= 1;
+                }
+            }
+            match self.peek()? {
+                Tok::EOF => return Err(self.err("unexpected end of file")),
+                Tok::IDENT => toks.push(MacroTok::Ident(self.str_intern())),
+                Tok::STR => toks.push(MacroTok::Str(self.str_intern())),
+                Tok::NUM => toks.push(MacroTok::Num(self.tok().num())),
+                Tok::ARG => toks.push(MacroTok::Arg((self.tok().num() as usize) - 1)),
+                tok => toks.push(MacroTok::Tok(tok)),
+            }
+            self.eat();
+        }
+        let toks = self.tok_int.intern(&toks);
+        self.macros.push(Macro {
+            name: label.string,
+            toks,
+        });
+        Ok(())
     }
 }
 
 enum Width {
-    UNK,
+    DP,
     ABS,
     ABL,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Addr(u8);
-
-// todo: syntax for forcing abs and long addr modes:
-// |$00       abs
-// @$000000   abl (xa assembler syntax)
 
 #[rustfmt::skip]
 impl Addr {
@@ -661,9 +1107,9 @@ impl Addr {
     const ABY: Self = Self(14); // |$0000,Y
     const ABL: Self = Self(15); // @$000000
     const ALX: Self = Self(16); // @$000000,X
-    const IND: Self = Self(17); // (|$0000)
-    const IAX: Self = Self(18); // (|$0000,X)
-    const IAL: Self = Self(19); // [@$000000]
+    const IAB: Self = Self(17); // ($0000)
+    const IAX: Self = Self(18); // ($0000,X)
+    const IAL: Self = Self(19); // [$0000]
     const REL: Self = Self(20); // ±$00
     const RLL: Self = Self(21); // ±$0000
     const BM: Self = Self(22);  // $00,$00
@@ -701,13 +1147,17 @@ impl Mne {
     const DEY: Self = Self("DEY");
     const EOR: Self = Self("EOR");
 
+    const JML: Self = Self("JML");
+    const JMP: Self = Self("JMP");
+    const JSR: Self = Self("JSR");
+
     const LDA: Self = Self("LDA");
     const LDX: Self = Self("LDX");
     const LDY: Self = Self("LDY");
 
-    const ORA: Self = Self("ORA");
-
     const NOP: Self = Self("NOP");
+
+    const ORA: Self = Self("ORA");
 
     const REP: Self = Self("REP");
 
@@ -722,7 +1172,7 @@ const ____: u8 = 0x42; // $42 (WDC) is reserved so we special-case it as a blank
 
 #[rustfmt::skip]
 const MNEMONICS: &[(Mne, &[u8; 23])] = &[
-    //           imp   imm   sr    dp    dpx   dpy   idp   idx   idy   idl   ily   isy   abs   abx   aby   abl   alx   ind   iax   ial   rel   rll   bm
+    //           imp   imm   sr    dp    dpx   dpy   idp   idx   idy   idl   ily   isy   abs   abx   aby   abl   alx   iab   iax   ial   rel   rll   bm
     (Mne::ADC, &[____, 0x69, 0x63, 0x65, 0x75, ____, 0x72, 0x61, 0x71, 0x67, 0x77, 0x73, 0x6D, 0x7D, 0x79, 0x6F, 0x7F, ____, ____, ____, ____, ____, ____]),
 
     (Mne::BRK, &[____, 0x00, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
@@ -732,11 +1182,44 @@ const MNEMONICS: &[(Mne, &[u8; 23])] = &[
     (Mne::WDC, &[____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Dir(&'static str);
 
-impl Dir {}
+impl Dir {
+    const BYT: Self = Self("BYT");
+    const WRD: Self = Self("WRD");
+    const DAT: Self = Self("DAT");
+    const PRG: Self = Self("PRG");
+    const PAD: Self = Self("PAD");
+    const ADJ: Self = Self("ADJ");
+    const INS: Self = Self("INS");
+    const IFF: Self = Self("IFF");
+    const IFD: Self = Self("IFD");
+    const IFN: Self = Self("IFN");
+    const END: Self = Self("END");
+    const IBT: Self = Self("IBT");
+    const IWD: Self = Self("IWD");
+    const ABT: Self = Self("ABT");
+    const AWD: Self = Self("AWD");
+}
 
-const DIRECTIVES: &[(Dir, bool)] = &[];
+const DIRECTIVES: &[(Dir, bool)] = &[
+    (Dir::BYT, false),
+    (Dir::WRD, false),
+    (Dir::DAT, false),
+    (Dir::PRG, true),
+    (Dir::PAD, true),
+    (Dir::ADJ, true),
+    (Dir::INS, true),
+    (Dir::IFF, true),
+    (Dir::IFD, true),
+    (Dir::IFN, true),
+    (Dir::END, true),
+    (Dir::IBT, true),
+    (Dir::IWD, true),
+    (Dir::ABT, true),
+    (Dir::AWD, true),
+];
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct Tok(u8);
@@ -763,6 +1246,10 @@ impl Tok {
     const HASH: Self = Self(b'#');
     const COMMA: Self = Self(b',');
     const ASP: Self = Self(b'@');
+
+    const X: Self = Self(b'X');
+    const Y: Self = Self(b'Y');
+    const S: Self = Self(b'S');
 
     const EOF: Self = Self(0x80);
     const IDENT: Self = Self(0x81);
@@ -813,13 +1300,6 @@ trait TokStream {
     fn num(&self) -> i32;
 
     fn line(&self) -> usize;
-
-    fn column(&self) -> usize;
-}
-
-// TODO: for macro storage
-struct TokInterner<'a> {
-    marker: PhantomData<&'a ()>,
 }
 
 struct StrInterner<'a> {
@@ -843,7 +1323,7 @@ impl<'a> StrInterner<'a> {
                 has_space = Some(i);
             }
             if let Some(index) = storage.find(string) {
-                // SAFETY: the assumption is that
+                // SAFETY: the assumption is that we never re-allocate storages
                 unsafe {
                     return str::from_utf8_unchecked(slice::from_raw_parts(
                         storage.as_ptr().add(index),
@@ -857,12 +1337,13 @@ impl<'a> StrInterner<'a> {
             &mut self.storages[index]
         } else {
             self.storages.push(String::with_capacity(
-                string.len().next_power_of_two().max(256),
+                string.len().next_multiple_of(2).max(256),
             ));
             self.storages.last_mut().unwrap()
         };
         let index = storage.len();
         storage.push_str(string);
+        // SAFETY: the assumption is that we never re-allocate storages
         unsafe {
             str::from_utf8_unchecked(slice::from_raw_parts(
                 storage.as_ptr().add(index),
@@ -878,13 +1359,18 @@ struct Label<'a> {
     string: &'a str,
 }
 
+impl<'a> Label<'a> {
+    fn new(scope: Option<&'a str>, string: &'a str) -> Self {
+        Self { scope, string }
+    }
+}
+
 struct Lexer<R> {
     reader: PeekReader<R>,
     string: String,
     number: i32,
     stash: Option<Tok>,
     line: usize,
-    column: usize,
 }
 
 impl<R: Read + Seek> Lexer<R> {
@@ -895,24 +1381,19 @@ impl<R: Read + Seek> Lexer<R> {
             number: 0,
             stash: None,
             line: 1,
-            column: 1,
         }
     }
 }
 
 impl<R: Read + Seek> TokStream for Lexer<R> {
     fn err(&self, msg: &str) -> io::Error {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("{}:{}: {msg}", self.line, self.column),
-        )
+        io::Error::new(ErrorKind::InvalidData, format!("{}: {msg}", self.line))
     }
 
     fn peek(&mut self) -> io::Result<Tok> {
         if let Some(tok) = self.stash {
             return Ok(tok);
         }
-
         // skip whitespace
         while let Some(c) = self.reader.peek()? {
             if !b" \t\r".contains(&c) {
@@ -926,7 +1407,6 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
                 self.reader.eat();
             }
         }
-
         match self.reader.peek()? {
             None => {
                 self.reader.eat();
@@ -1035,13 +1515,14 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
                     if let Some(tok) = GRAPHEMES
                         .iter()
                         .find_map(|(bs, tok)| (*bs == s).then_some(tok))
-                        .cloned()
+                        .copied()
                     {
                         self.reader.eat();
                         self.stash = Some(tok);
                         return Ok(tok);
                     }
                 }
+                // else return an uppercase of whatever this char is
                 self.stash = Some(Tok(c.to_ascii_uppercase()));
                 Ok(Tok(c.to_ascii_uppercase()))
             }
@@ -1050,14 +1531,15 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
 
     fn eat(&mut self) {
         self.string.clear();
-        self.column += 1;
         if let Some(Tok::NEWLINE) = self.stash.take() {
-            self.column = 1;
             self.line += 1;
         }
     }
 
     fn rewind(&mut self) -> io::Result<()> {
+        self.string.clear();
+        self.stash = None;
+        self.line = 1;
         self.reader.rewind()
     }
 
@@ -1072,9 +1554,133 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
     fn line(&self) -> usize {
         self.line
     }
+}
 
-    fn column(&self) -> usize {
-        self.column
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacroTok<'a> {
+    Tok(Tok),
+    Str(&'a str),
+    Ident(&'a str),
+    Num(i32),
+    Arg(usize),
+}
+
+#[derive(Clone, Copy)]
+struct Macro<'a> {
+    name: &'a str,
+    toks: &'a [MacroTok<'a>],
+}
+
+struct MacroInvocation<'a> {
+    inner: Macro<'a>,
+    line: usize,
+    index: usize,
+    args: Vec<MacroTok<'a>>,
+}
+
+impl<'a> TokStream for MacroInvocation<'a> {
+    fn err(&self, msg: &str) -> io::Error {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("{}:{}: {msg}", self.line, self.inner.name),
+        )
+    }
+
+    fn peek(&mut self) -> io::Result<Tok> {
+        match self.inner.toks[self.index] {
+            MacroTok::Tok(tok) => Ok(tok),
+            MacroTok::Str(_) => Ok(Tok::STR),
+            MacroTok::Ident(_) => Ok(Tok::IDENT),
+            MacroTok::Num(_) => Ok(Tok::NUM),
+            MacroTok::Arg(index) => {
+                if index > self.args.len() {
+                    return Err(self.err("argument is undefined"));
+                }
+                match self.args[index] {
+                    MacroTok::Tok(tok) => Ok(tok),
+                    MacroTok::Str(_) => Ok(Tok::STR),
+                    MacroTok::Ident(_) => Ok(Tok::IDENT),
+                    MacroTok::Num(_) => Ok(Tok::NUM),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn eat(&mut self) {
+        self.index += 1;
+    }
+
+    fn rewind(&mut self) -> io::Result<()> {
+        self.index = 0;
+        Ok(())
+    }
+
+    fn str(&self) -> &str {
+        match self.inner.toks[self.index] {
+            MacroTok::Str(string) => string,
+            MacroTok::Ident(string) => string,
+            MacroTok::Arg(index) => match self.args[index] {
+                MacroTok::Str(string) => string,
+                MacroTok::Ident(string) => string,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn num(&self) -> i32 {
+        match self.inner.toks[self.index] {
+            MacroTok::Num(val) => val,
+            MacroTok::Arg(index) => match self.args[index] {
+                MacroTok::Num(val) => val,
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn line(&self) -> usize {
+        self.line
+    }
+}
+
+struct TokInterner<'a> {
+    storages: Vec<Vec<MacroTok<'a>>>,
+}
+
+impl<'a> TokInterner<'a> {
+    fn new() -> Self {
+        Self {
+            storages: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, toks: &[MacroTok<'a>]) -> &'a [MacroTok<'a>] {
+        let mut has_space = None;
+        for (i, storage) in self.storages.iter().enumerate() {
+            // pre-check if we have space for the toks in case we have a cache miss
+            if has_space.is_none() && ((storage.capacity() - storage.len()) >= toks.len()) {
+                has_space = Some(i);
+            }
+            if let Some(index) = storage.windows(toks.len()).position(|win| win == toks) {
+                // SAFETY: the assumption is that we never re-allocate storages
+                unsafe {
+                    return slice::from_raw_parts(storage.as_ptr().add(index), toks.len());
+                }
+            }
+        }
+        // cache miss, add to a storage if possible
+        let storage = if let Some(index) = has_space {
+            &mut self.storages[index]
+        } else {
+            self.storages.push(Vec::with_capacity(toks.len().max(256)));
+            self.storages.last_mut().unwrap()
+        };
+        let index = storage.len();
+        storage.extend_from_slice(toks);
+        // SAFETY: the assumption is that we never re-allocate storages
+        unsafe { slice::from_raw_parts(storage.as_ptr().add(index), toks.len()) }
     }
 }
 

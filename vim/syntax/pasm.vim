@@ -18,6 +18,7 @@ syn keyword pasmOpcode rep rol ror rti rtl rts sbc sec sed sei sep sta stp stx s
 syn keyword pasmOpcode tax tay tcd tcs tdc trb tsb tsc tsx txa txs txy tya tyx wai wdc xba xce
 
 syn keyword pasmDirective byt wrd dat prg pad adj put iff ifd ifn end i08 i16 a08 a16 c02 c16
+syn keyword pasmDirective mac equ
 
 syn match pasmComment ";.*" contains=pasmTodo
 syn keyword pasmTodo  contained todo fixme xxx warning danger note notice bug

@@ -7,7 +7,8 @@ syn match pasmLocalLabel "^\.[a-z_][a-z0-9_]*"
 
 syn keyword pasmRegister x y s *
 
-syn keyword pasmOperator - < > / % * << >> ~> && || ~ + ^ ! & |
+syn match pasmOperator display "\%(+\|-\|/\|*\|\^\|\~\|&\||\|!\|>\|<\|%\)=\?"
+syn match pasmOperator display "&&\|||\|<<\|>>\|~>"
 
 syn keyword pasmOpcode adc and asl bcc bcs beq bit bmi bne bpl bra brk brl bvc bvs
 syn keyword pasmOpcode clc cld cli clv cmp cop cpx cpy dec dex dey eor inc inx iny
@@ -35,8 +36,8 @@ hi def link pasmString	      String
 hi def link pasmIdentifier    Identifier
 hi def link pasmOpcode        Keyword
 hi def link pasmDirective     PreProc
-hi def link pasmGlobalLabel   Underlined
-hi def link pasmLocalLabel    Underlined
+hi def link pasmGlobalLabel   Function
+hi def link pasmLocalLabel    Function
 hi def link pasmTodo          Todo
 
 let b:current_syntax = "pasm"

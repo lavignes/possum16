@@ -114,6 +114,7 @@ struct Asm<'a> {
     pc_end: bool,
     dat_end: bool,
     dat_mode: bool,
+    c16_mode: bool,
     accum_16: bool,
     index_16: bool,
     syms: Vec<(Label<'a>, i32)>,
@@ -139,6 +140,7 @@ impl<'a> Asm<'a> {
             pc_end: false,
             dat_end: false,
             dat_mode: false,
+            c16_mode: false,
             accum_16: false,
             index_16: false,
             syms: Vec::new(),
@@ -160,6 +162,7 @@ impl<'a> Asm<'a> {
         self.pc_end = false;
         self.dat_end = false;
         self.dat_mode = false;
+        self.c16_mode = false;
         self.accum_16 = false;
         self.index_16 = false;
         self.scope = None;
@@ -645,8 +648,14 @@ impl<'a> Asm<'a> {
     }
 
     fn check_opcode(&self, addrs: &[u8; 23], addr: Addr) -> io::Result<u8> {
-        self.find_opcode(addrs, addr)
-            .ok_or_else(|| self.err("illegal address mode"))
+        let op = self
+            .find_opcode(addrs, addr)
+            .ok_or_else(|| self.err("illegal address mode"))?;
+        if !self.c16_mode && C16_OPCODES.contains(&op) {
+            Err(self.err("illegal instruction"))
+        } else {
+            Ok(op)
+        }
     }
 
     fn expect(&mut self, tok: Tok) -> io::Result<()> {
@@ -774,6 +783,7 @@ impl<'a> Asm<'a> {
             }
             _ => {
                 if let Some(op) = self.find_opcode(mne.1, Addr::REL) {
+                    self.check_opcode(mne.1, Addr::REL)?; // handle c02 errors
                     let expr = self.expr()?;
                     if self.emit {
                         let branch = (self.pc() as i32) + self.const_expr(expr)?;
@@ -786,6 +796,7 @@ impl<'a> Asm<'a> {
                     return self.add_pc(2);
                 }
                 if let Some(op) = self.find_opcode(mne.1, Addr::RLL) {
+                    self.check_opcode(mne.1, Addr::RLL)?; // handle c02 errors
                     let expr = self.expr()?;
                     if self.emit {
                         let branch = (self.pc() as i32) + self.const_expr(expr)?;
@@ -798,6 +809,7 @@ impl<'a> Asm<'a> {
                     return self.add_pc(3);
                 }
                 if let Some(op) = self.find_opcode(mne.1, Addr::BM) {
+                    self.check_opcode(mne.1, Addr::BM)?; // handle c02 errors
                     let src = self.expr()?;
                     self.expect(Tok::COMMA)?;
                     let dst = self.expr()?;
@@ -1054,7 +1066,7 @@ impl<'a> Asm<'a> {
                 }
                 self.add_pc(adj)?;
             }
-            Dir::INS => {
+            Dir::PUT => {
                 if self.peek()? != Tok::STR {
                     return Err(self.err("expected file name"));
                 }
@@ -1100,17 +1112,23 @@ impl<'a> Asm<'a> {
                 }
                 self.if_level -= 1;
             }
-            Dir::IBT => {
+            Dir::I08 => {
                 self.index_16 = false;
             }
-            Dir::IWD => {
+            Dir::I16 => {
                 self.index_16 = true;
             }
-            Dir::ABT => {
+            Dir::A08 => {
                 self.accum_16 = false;
             }
-            Dir::AWD => {
+            Dir::A16 => {
                 self.accum_16 = true;
+            }
+            Dir::C02 => {
+                self.c16_mode = false;
+            }
+            Dir::C16 => {
+                self.c16_mode = true;
             }
             _ => unreachable!(),
         }
@@ -1274,7 +1292,7 @@ impl Mne {
     const TAX: Self = Self("TAX");
     const TAY: Self = Self("TAY");
     const TCD: Self = Self("TCD");
-    const TCS: Self = Self("TCD");
+    const TCS: Self = Self("TCS");
     const TDC: Self = Self("TDC");
     const TRB: Self = Self("TRB");
     const TSB: Self = Self("TSB");
@@ -1393,6 +1411,16 @@ const MNEMONICS: &[(Mne, &[u8; 23])] = &[
     (Mne::XCE, &[0xFB, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____, ____]),
 ];
 
+#[rustfmt::skip]
+const C16_OPCODES: &[u8] = &[
+    0x02, 0x03, 0x07, 0x0B, 0x0F, 0x13, 0x17, 0x1B, 0x1F, 0x22, 0x23, 0x27, 0x2B, 0x2F,
+    0x33, 0x37, 0x3B, 0x3F, 0x24, 0x43, 0x44, 0x47, 0x4B, 0x4F, 0x53, 0x54, 0x57, 0x5B, 0x5C, 0x5F,
+    0x62, 0x63, 0x67, 0x6B, 0x6F, 0x73, 0x77, 0x7B, 0x7F, 0x82, 0x83, 0x87, 0x8B, 0x8F,
+    0x93, 0x97, 0x9B, 0x9F, 0xA3, 0xA7, 0xAB, 0xAF, 0xB3, 0xB7, 0xBB, 0xBF,
+    0xC2, 0xC3, 0xC7, 0xCF, 0xD3, 0xD4, 0xD7, 0xDC, 0xDF,
+    0xE2, 0xE3, 0xE7, 0xEB, 0xEF, 0xF3, 0xF4, 0xF7, 0xFB, 0xFC, 0xFF
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Dir(&'static str);
 
@@ -1403,15 +1431,17 @@ impl Dir {
     const PRG: Self = Self("PRG");
     const PAD: Self = Self("PAD");
     const ADJ: Self = Self("ADJ");
-    const INS: Self = Self("INS");
+    const PUT: Self = Self("PUT");
     const IFF: Self = Self("IFF");
     const IFD: Self = Self("IFD");
     const IFN: Self = Self("IFN");
     const END: Self = Self("END");
-    const IBT: Self = Self("IBT");
-    const IWD: Self = Self("IWD");
-    const ABT: Self = Self("ABT");
-    const AWD: Self = Self("AWD");
+    const I08: Self = Self("I08");
+    const I16: Self = Self("I16");
+    const A08: Self = Self("A08");
+    const A16: Self = Self("A16");
+    const C02: Self = Self("C02");
+    const C16: Self = Self("C16");
 }
 
 const DIRECTIVES: &[(Dir, bool)] = &[
@@ -1421,15 +1451,17 @@ const DIRECTIVES: &[(Dir, bool)] = &[
     (Dir::PRG, true),
     (Dir::PAD, true),
     (Dir::ADJ, true),
-    (Dir::INS, true),
+    (Dir::PUT, true),
     (Dir::IFF, true),
     (Dir::IFD, true),
     (Dir::IFN, true),
     (Dir::END, true),
-    (Dir::IBT, true),
-    (Dir::IWD, true),
-    (Dir::ABT, true),
-    (Dir::AWD, true),
+    (Dir::I08, true),
+    (Dir::I16, true),
+    (Dir::A08, true),
+    (Dir::A16, true),
+    (Dir::C02, true),
+    (Dir::C16, true),
 ];
 
 #[derive(Copy, Clone, PartialEq, Eq)]

@@ -10,7 +10,7 @@ pub trait BusDevice {
     fn tick<B: Bus>(&mut self, bus: &mut B);
 
     fn read(&mut self, _addr: u32) -> u8 {
-        0
+        0xFF
     }
 
     fn write(&mut self, _addr: u32, _data: u8) {}

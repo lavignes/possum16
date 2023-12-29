@@ -10,7 +10,7 @@ impl Flags {
     const D: u8 = 1 << 3; // decimal
     const B: u8 = 1 << 4; // break (only in emulation mode)
     const X: u8 = 1 << 4; // 0=16-bit 1=8-bit index
-    const M: u8 = 1 << 5; // 0=16-bit 1=8-bit accumulator
+    const M: u8 = 1 << 5; // 0=16-bit 1=8-bit accumulator/memory
     const V: u8 = 1 << 6; // overflow
     const N: u8 = 1 << 7; // negative
 }
@@ -28,7 +28,14 @@ enum Mode {
     Native,
 }
 
-struct Cpu {
+impl Default for Mode {
+    fn default() -> Self {
+        Self::Emulation
+    }
+}
+
+#[derive(Default)]
+pub struct Cpu {
     pc: u16,    // program counter
     c: [u8; 2], // accumulator
     x: [u8; 2], // index x
@@ -46,6 +53,10 @@ struct Cpu {
 }
 
 impl Cpu {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     fn push<B: Bus>(&mut self, bus: &mut B, data: u8) {
         bus.write(u16::from_le_bytes(self.s) as u32, data);
         if self.mode == Mode::Emulation {
@@ -300,19 +311,19 @@ impl Cpu {
         let addr = ea(self, bus);
         if (self.p & Flags::M) != 0 {
             let data = bus.read(addr);
-            let (result, carry) = data.overflowing_shl(1);
+            let result = data << 1;
             bus.write(addr, result);
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (data & 0x80) != 0);
             self.set_flag(Flags::N, (result & 0x80) != 0);
             self.set_flag(Flags::Z, result == 0);
         } else {
             let lo = bus.read(addr);
             let hi = bus.read(addr.wrapping_add(1));
             let data = u16::from_le_bytes([lo, hi]);
-            let (result, carry) = data.overflowing_shl(1);
+            let result = data << 1;
             bus.write(addr, result as u8);
             bus.write(addr.wrapping_add(1), (result >> 8) as u8);
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (data & 0x8000) != 0);
             self.set_flag(Flags::N, (result & 0x8000) != 0);
             self.set_flag(Flags::Z, result == 0);
         }
@@ -324,16 +335,17 @@ impl Cpu {
 
     fn op_asl_a(&mut self) {
         if (self.p & Flags::M) != 0 {
-            let (result, carry) = self.c[0].overflowing_shl(1);
+            let a = self.c[0];
+            let result = a << 1;
             self.c[0] = result;
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (a & 0x80) != 0);
             self.set_flag(Flags::N, (result & 0x80) != 0);
             self.set_flag(Flags::Z, result == 0);
         } else {
             let c = u16::from_le_bytes(self.c);
-            let (result, carry) = c.overflowing_shl(1);
+            let result = c << 1;
             self.c = result.to_le_bytes();
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (c & 0x8000) != 0);
             self.set_flag(Flags::N, (result & 0x8000) != 0);
             self.set_flag(Flags::Z, result == 0);
         }
@@ -391,7 +403,11 @@ impl Cpu {
     }
 
     fn op_tcs(&mut self) {
-        self.s = self.c;
+        if self.mode == Mode::Emulation {
+            self.s[0] = self.c[0];
+        } else {
+            self.s = self.c;
+        }
     }
 
     fn op_jsr<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
@@ -452,21 +468,19 @@ impl Cpu {
         let addr = ea(self, bus);
         if (self.p & Flags::M) != 0 {
             let data = bus.read(addr);
-            let (result, carry) = data.overflowing_shl(1);
-            let result = result | (self.p & Flags::C);
+            let result = (data << 1) | (self.p & Flags::C);
             bus.write(addr, result);
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (data & 0x80) != 0);
             self.set_flag(Flags::N, (result & 0x80) != 0);
             self.set_flag(Flags::Z, result == 0);
         } else {
             let lo = bus.read(addr);
             let hi = bus.read(addr.wrapping_add(1));
             let data = u16::from_le_bytes([lo, hi]);
-            let (result, carry) = data.overflowing_shl(1);
-            let result = result | (((self.p & Flags::C) as u16) << 8);
+            let result = (data << 1) | ((self.p & Flags::C) as u16);
             bus.write(addr, result as u8);
             bus.write(addr.wrapping_add(1), (result >> 8) as u8);
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (data & 0x8000) != 0);
             self.set_flag(Flags::N, (result & 0x8000) != 0);
             self.set_flag(Flags::Z, result == 0);
         }
@@ -479,18 +493,17 @@ impl Cpu {
 
     fn op_rol_a(&mut self) {
         if (self.p & Flags::M) != 0 {
-            let (result, carry) = self.c[0].overflowing_shl(1);
-            let result = result | (self.p & Flags::C);
+            let a = self.c[0];
+            let result = (a << 1) | (self.p & Flags::C);
             self.c[0] = result;
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (a & 0x80) != 0);
             self.set_flag(Flags::N, (result & 0x80) != 0);
             self.set_flag(Flags::Z, result == 0);
         } else {
             let c = u16::from_le_bytes(self.c);
-            let (result, carry) = c.overflowing_shl(1);
-            let result = result | (((self.p & Flags::C) as u16) << 8);
+            let result = (c << 1) | ((self.p & Flags::C) as u16);
             self.c = result.to_le_bytes();
-            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::C, (c & 0x8000) != 0);
             self.set_flag(Flags::N, (result & 0x8000) != 0);
             self.set_flag(Flags::Z, result == 0);
         }
@@ -581,20 +594,20 @@ impl Cpu {
         let addr = ea(self, bus);
         if (self.p & Flags::M) != 0 {
             let data = bus.read(addr);
-            let (result, carry) = data.overflowing_shr(1);
+            let result = data >> 1;
             bus.write(addr, result);
-            self.set_flag(Flags::C, carry);
-            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::C, (data & 0x01) != 0);
+            self.set_flag(Flags::N, false);
             self.set_flag(Flags::Z, result == 0);
         } else {
             let lo = bus.read(addr);
             let hi = bus.read(addr.wrapping_add(1));
             let data = u16::from_le_bytes([lo, hi]);
-            let (result, carry) = data.overflowing_shr(1);
+            let result = data >> 1;
             bus.write(addr, result as u8);
             bus.write(addr.wrapping_add(1), (result >> 8) as u8);
-            self.set_flag(Flags::C, carry);
-            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::C, (data & 0x0001) != 0);
+            self.set_flag(Flags::N, false);
             self.set_flag(Flags::Z, result == 0);
         }
     }
@@ -610,17 +623,18 @@ impl Cpu {
 
     fn op_lsr_a(&mut self) {
         if (self.p & Flags::M) != 0 {
-            let (result, carry) = self.c[0].overflowing_shr(1);
+            let a = self.c[0];
+            let result = a >> 1;
             self.c[0] = result;
-            self.set_flag(Flags::C, carry);
-            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::C, (a & 0x01) != 0);
+            self.set_flag(Flags::N, false);
             self.set_flag(Flags::Z, result == 0);
         } else {
             let c = u16::from_le_bytes(self.c);
-            let (result, carry) = c.overflowing_shr(1);
+            let result = c >> 1;
             self.c = result.to_le_bytes();
-            self.set_flag(Flags::C, carry);
-            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::C, (c & 0x0001) != 0);
+            self.set_flag(Flags::N, false);
             self.set_flag(Flags::Z, result == 0);
         }
     }
@@ -645,18 +659,150 @@ impl Cpu {
         todo!();
     }
 
-    fn op_cli(&mut self) {}
-    fn op_phy<B: Bus>(&mut self, bus: &mut B) {}
-    fn op_tcd(&mut self) {}
-    fn op_jml<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_rts<B: Bus>(&mut self, bus: &mut B) {}
-    fn op_adc<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_per<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_stz<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_ror<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_pla<B: Bus>(&mut self, bus: &mut B) {}
-    fn op_ror_a(&mut self) {}
-    fn op_rtl<B: Bus>(&mut self, bus: &mut B) {}
+    fn op_cli(&mut self) {
+        self.set_flag(Flags::I, false);
+    }
+
+    fn op_phy<B: Bus>(&mut self, bus: &mut B) {
+        if (self.p & Flags::X) != 0 {
+            self.push(bus, self.y[0]);
+        } else {
+            self.push(bus, self.y[1]);
+            self.push(bus, self.y[0]);
+        }
+    }
+
+    fn op_tcd(&mut self) {
+        let result = u16::from_le_bytes(self.c);
+        self.set_flag(Flags::N, (result & 0x8000) != 0);
+        self.set_flag(Flags::Z, result == 0);
+        self.d = result;
+    }
+
+    fn op_jml<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        self.pc = addr as u16;
+        self.pbr = (addr >> 16) as u8;
+    }
+
+    fn op_rts<B: Bus>(&mut self, bus: &mut B) {
+        let lo = self.pull(bus);
+        let hi = self.pull(bus);
+        self.pc = u16::from_le_bytes([lo, hi]);
+    }
+
+    fn op_adc<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = bus.read(addr);
+            let (result, carry1) = self.c[0].overflowing_add(data);
+            let (result, carry2) =
+                result.overflowing_add(if (self.p & Flags::C) != 0 { 1 } else { 0 });
+            let overflow = ((!(self.c[0] ^ data)) & (self.c[0] ^ result) & 0x80) != 0;
+            self.c[0] = result;
+            self.set_flag(Flags::V, overflow);
+            self.set_flag(Flags::C, carry1 || carry2);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = u16::from_le_bytes([lo, hi]);
+            let c = u16::from_le_bytes(self.c);
+            let (result, carry1) = c.overflowing_add(data);
+            let (result, carry2) =
+                result.overflowing_add(if (self.p & Flags::C) != 0 { 1 } else { 0 });
+            let overflow = ((!(c ^ data)) & (c ^ result) & 0x8000) != 0;
+            self.c = result.to_le_bytes();
+            self.set_flag(Flags::V, overflow);
+            self.set_flag(Flags::C, carry1 || carry2);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_per<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        let lo = bus.read(addr);
+        let hi = bus.read(addr.wrapping_add(1));
+        let offset = i16::from_le_bytes([lo, hi]);
+        let result = self.pc.wrapping_add_signed(offset);
+        self.push(bus, (result >> 8) as u8);
+        self.push(bus, result as u8);
+    }
+
+    fn op_stz<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            bus.write(addr, 0);
+        } else {
+            bus.write(addr, 0);
+            bus.write(addr.wrapping_add(1), 0);
+        }
+    }
+
+    fn op_ror<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = bus.read(addr);
+            let result = (data >> 1) | ((self.p & Flags::C) << 7);
+            bus.write(addr, result);
+            self.set_flag(Flags::C, (data & 0x01) != 0);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = u16::from_le_bytes([lo, hi]);
+            let result = (data >> 1) | (((self.p & Flags::C) as u16) << 15);
+            bus.write(addr, result as u8);
+            bus.write(addr.wrapping_add(1), (result >> 8) as u8);
+            self.set_flag(Flags::C, (data & 0x0001) != 0);
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_pla<B: Bus>(&mut self, bus: &mut B) {
+        if (self.p & Flags::M) != 0 {
+            let result = self.pull(bus);
+            self.c[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = self.pull(bus);
+            let hi = self.pull(bus);
+            let result = u16::from_le_bytes([lo, hi]);
+            self.c = result.to_le_bytes();
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_ror_a(&mut self) {
+        if (self.p & Flags::M) != 0 {
+            let a = self.c[0];
+            let result = (a >> 1) | ((self.p & Flags::C) << 7);
+            self.c[0] = a;
+            self.set_flag(Flags::C, (a & 0x01) != 0);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let c = u16::from_le_bytes(self.c);
+            let result = (c >> 1) | (((self.p & Flags::C) as u16) << 15);
+            self.c = result.to_le_bytes();
+            self.set_flag(Flags::C, (c & 0x0001) != 0);
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_rtl<B: Bus>(&mut self, bus: &mut B) {
+        let lo = self.pull(bus);
+        let hi = self.pull(bus);
+        self.pbr = self.pull(bus);
+        self.pc = u16::from_le_bytes([lo, hi]);
+    }
 
     fn op_bvs<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
         let addr = ea(self, bus);
@@ -666,9 +812,31 @@ impl Cpu {
         }
     }
 
-    fn op_sei(&mut self) {}
-    fn op_ply<B: Bus>(&mut self, bus: &mut B) {}
-    fn op_tdc(&mut self) {}
+    fn op_sei(&mut self) {
+        self.set_flag(Flags::I, true);
+    }
+
+    fn op_ply<B: Bus>(&mut self, bus: &mut B) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.pull(bus);
+            self.y[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = self.pull(bus);
+            let hi = self.pull(bus);
+            let result = u16::from_le_bytes([lo, hi]);
+            self.y = result.to_le_bytes();
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_tdc(&mut self) {
+        self.c = self.d.to_le_bytes();
+        self.set_flag(Flags::N, (self.d & 0x8000) != 0);
+        self.set_flag(Flags::Z, self.d == 0);
+    }
 
     fn op_bra<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
         let addr = ea(self, bus);
@@ -676,7 +844,15 @@ impl Cpu {
         self.pc = self.pc.wrapping_add_signed(offset as i16);
     }
 
-    fn op_sta<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
+    fn op_sta<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            bus.write(addr, self.c[0]);
+        } else {
+            bus.write(addr, self.c[0]);
+            bus.write(addr.wrapping_add(1), self.c[1]);
+        }
+    }
 
     fn op_brl<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
         let addr = ea(self, bus);
@@ -686,11 +862,58 @@ impl Cpu {
         self.pc = self.pc.wrapping_add_signed(offset);
     }
 
-    fn op_sty<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_stx<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_dey(&mut self) {}
-    fn op_txa(&mut self) {}
-    fn op_phb<B: Bus>(&mut self, bus: &mut B) {}
+    fn op_sty<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::X) != 0 {
+            bus.write(addr, self.y[0]);
+        } else {
+            bus.write(addr, self.y[0]);
+            bus.write(addr.wrapping_add(1), self.y[1]);
+        }
+    }
+
+    fn op_stx<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::X) != 0 {
+            bus.write(addr, self.x[0]);
+        } else {
+            bus.write(addr, self.x[0]);
+            bus.write(addr.wrapping_add(1), self.y[1]);
+        }
+    }
+
+    fn op_dey(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.y[0].wrapping_sub(1);
+            self.y[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let y = u16::from_le_bytes(self.y);
+            let result = y.wrapping_sub(1);
+            self.y = result.to_le_bytes();
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_txa(&mut self) {
+        if (self.p & Flags::M) != 0 {
+            let result = self.x[0];
+            self.c[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let result = u16::from_le_bytes(self.x);
+            self.c = self.x;
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_phb<B: Bus>(&mut self, bus: &mut B) {
+        self.push(bus, self.dbr);
+    }
 
     fn op_bcc<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
         let addr = ea(self, bus);
@@ -700,15 +923,127 @@ impl Cpu {
         }
     }
 
-    fn op_tya(&mut self) {}
-    fn op_txs(&mut self) {}
-    fn op_txy(&mut self) {}
-    fn op_ldy<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_lda<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_ldx<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_tay(&mut self) {}
-    fn op_tax(&mut self) {}
-    fn op_plb<B: Bus>(&mut self, bus: &mut B) {}
+    fn op_tya(&mut self) {
+        if (self.p & Flags::M) != 0 {
+            let result = self.y[0];
+            self.c[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let result = u16::from_le_bytes(self.y);
+            self.c = self.y;
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_txs(&mut self) {
+        if self.mode == Mode::Emulation {
+            self.s[0] = self.x[0];
+        } else {
+            self.s = self.x;
+        }
+    }
+
+    fn op_txy(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.x[0];
+            self.y[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let result = u16::from_le_bytes(self.x);
+            self.y = self.x;
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_ldy<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::X) != 0 {
+            let data = bus.read(addr);
+            self.y[0] = data;
+            self.set_flag(Flags::N, (data & 0x80) != 0);
+            self.set_flag(Flags::Z, data == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let result = u16::from_le_bytes([lo, hi]);
+            self.y = [lo, hi];
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_lda<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = bus.read(addr);
+            self.c[0] = data;
+            self.set_flag(Flags::N, (data & 0x80) != 0);
+            self.set_flag(Flags::Z, data == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let result = u16::from_le_bytes([lo, hi]);
+            self.c = [lo, hi];
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_ldx<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = bus.read(addr);
+            self.x[0] = data;
+            self.set_flag(Flags::N, (data & 0x80) != 0);
+            self.set_flag(Flags::Z, data == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let result = u16::from_le_bytes([lo, hi]);
+            self.x = [lo, hi];
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_tay(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.c[0];
+            self.y[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let result = u16::from_le_bytes(self.c);
+            self.y = self.c;
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_tax(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.c[0];
+            self.x[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let result = u16::from_le_bytes(self.c);
+            self.x = self.c;
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_plb<B: Bus>(&mut self, bus: &mut B) {
+        let result = self.pull(bus);
+        self.pbr = result;
+        self.set_flag(Flags::N, (result & 0x80) != 0);
+        self.set_flag(Flags::Z, result == 0);
+    }
 
     fn op_bcs<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
         let addr = ea(self, bus);
@@ -718,16 +1053,324 @@ impl Cpu {
         }
     }
 
-    fn op_clv(&mut self) {}
-    fn op_tsx(&mut self) {}
-    fn op_tyx(&mut self) {}
-    fn op_cpy<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_cmp<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_rep<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_dec<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {}
-    fn op_iny(&mut self) {}
-    fn op_dex(&mut self) {}
-    fn op_wai(&mut self) {}
+    fn op_clv(&mut self) {
+        self.set_flag(Flags::V, false);
+    }
+
+    fn op_tsx(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.s[0];
+            self.x[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let result = u16::from_le_bytes(self.s);
+            self.x = self.s;
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_tyx(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.x[0];
+            self.y[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let result = u16::from_le_bytes(self.x);
+            self.y = self.x;
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_cpy<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::X) != 0 {
+            let data = bus.read(addr);
+            let (result, carry) = self.y[0].overflowing_sub(data);
+            self.y[0] = result;
+            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = u16::from_le_bytes([lo, hi]);
+            let y = u16::from_le_bytes(self.y);
+            let (result, carry) = y.overflowing_sub(data);
+            self.y = result.to_le_bytes();
+            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_cmp<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = bus.read(addr);
+            let (result, carry) = self.c[0].overflowing_sub(data);
+            self.c[0] = result;
+            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = u16::from_le_bytes([lo, hi]);
+            let c = u16::from_le_bytes(self.c);
+            let (result, carry) = c.overflowing_sub(data);
+            self.c = result.to_le_bytes();
+            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_rep<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        let data = bus.read(addr);
+        self.set_flag(data, false);
+        if self.mode == Mode::Emulation {
+            self.set_flag(Flags::X | Flags::M, true);
+        }
+    }
+
+    fn op_dec<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = bus.read(addr);
+            let result = data.wrapping_sub(1);
+            bus.write(addr, result);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = u16::from_le_bytes([lo, hi]);
+            let result = data.wrapping_sub(1);
+            bus.write(addr, result as u8);
+            bus.write(addr.wrapping_add(1), (result >> 8) as u8);
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_iny(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.y[0].wrapping_add(1);
+            self.y[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let y = u16::from_le_bytes(self.y);
+            let result = y.wrapping_add(1);
+            self.y = result.to_le_bytes();
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_dex(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.x[0].wrapping_sub(1);
+            self.x[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let x = u16::from_le_bytes(self.x);
+            let result = x.wrapping_sub(1);
+            self.x = result.to_le_bytes();
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_wai(&mut self) {
+        todo!();
+    }
+
+    fn op_bne<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        let offset = bus.read(addr) as i8;
+        if (self.p & Flags::Z) == 0 {
+            self.pc = self.pc.wrapping_add_signed(offset as i16);
+        }
+    }
+
+    fn op_pei<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        todo!();
+    }
+
+    fn op_cld(&mut self) {
+        self.set_flag(Flags::D, false);
+    }
+
+    fn op_phx<B: Bus>(&mut self, bus: &mut B) {
+        if (self.p & Flags::X) != 0 {
+            self.push(bus, self.x[0]);
+        } else {
+            self.push(bus, self.x[1]);
+            self.push(bus, self.x[0]);
+        }
+    }
+
+    fn op_stp(&mut self) {
+        todo!();
+    }
+
+    fn op_cpx<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::X) != 0 {
+            let data = bus.read(addr);
+            let (result, carry) = self.x[0].overflowing_sub(data);
+            self.x[0] = result;
+            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = u16::from_le_bytes([lo, hi]);
+            let x = u16::from_le_bytes(self.x);
+            let (result, carry) = x.overflowing_sub(data);
+            self.x = result.to_le_bytes();
+            self.set_flag(Flags::C, carry);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_sbc<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = !bus.read(addr); // invert!
+            let (result, carry1) = self.c[0].overflowing_sub(data);
+            let (result, carry2) =
+                result.overflowing_add(if (self.p & Flags::C) != 0 { 1 } else { 0 });
+            let overflow = ((!(self.c[0] ^ data)) & (self.c[0] ^ result) & 0x80) != 0;
+            self.c[0] = result;
+            self.set_flag(Flags::V, overflow);
+            self.set_flag(Flags::C, carry1 || carry2);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = !u16::from_le_bytes([lo, hi]); // invert!
+            let c = u16::from_le_bytes(self.c);
+            let (result, carry1) = c.overflowing_add(data);
+            let (result, carry2) =
+                result.overflowing_add(if (self.p & Flags::C) != 0 { 1 } else { 0 });
+            let overflow = ((!(c ^ data)) & (c ^ result) & 0x8000) != 0;
+            self.c = result.to_le_bytes();
+            self.set_flag(Flags::V, overflow);
+            self.set_flag(Flags::C, carry1 || carry2);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_sep<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        let data = bus.read(addr);
+        self.set_p(data);
+    }
+
+    fn op_inc<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        if (self.p & Flags::M) != 0 {
+            let data = bus.read(addr);
+            let result = data.wrapping_add(1);
+            bus.write(addr, result);
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = bus.read(addr);
+            let hi = bus.read(addr.wrapping_add(1));
+            let data = u16::from_le_bytes([lo, hi]);
+            let result = data.wrapping_add(1);
+            bus.write(addr, result as u8);
+            bus.write(addr.wrapping_add(1), (result >> 8) as u8);
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_inx(&mut self) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.x[0].wrapping_add(1);
+            self.x[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let x = u16::from_le_bytes(self.x);
+            let result = x.wrapping_add(1);
+            self.x = result.to_le_bytes();
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_nop(&mut self) {}
+
+    fn op_xba(&mut self) {
+        let tmp = self.c[1];
+        self.c[1] = self.c[0];
+        self.c[0] = tmp;
+        self.set_flag(Flags::N, (tmp & 0x80) != 0);
+        self.set_flag(Flags::Z, tmp == 0);
+    }
+
+    fn op_beq<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        let offset = bus.read(addr) as i8;
+        if (self.p & Flags::Z) != 0 {
+            self.pc = self.pc.wrapping_add_signed(offset as i16);
+        }
+    }
+
+    fn op_pea<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
+        let addr = ea(self, bus);
+        self.push(bus, (addr >> 8) as u8);
+        self.push(bus, addr as u8);
+    }
+
+    fn op_sed(&mut self) {
+        self.set_flag(Flags::D, true);
+    }
+
+    fn op_plx<B: Bus>(&mut self, bus: &mut B) {
+        if (self.p & Flags::X) != 0 {
+            let result = self.pull(bus);
+            self.x[0] = result;
+            self.set_flag(Flags::N, (result & 0x80) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        } else {
+            let lo = self.pull(bus);
+            let hi = self.pull(bus);
+            let result = u16::from_le_bytes([lo, hi]);
+            self.x = result.to_le_bytes();
+            self.set_flag(Flags::N, (result & 0x8000) != 0);
+            self.set_flag(Flags::Z, result == 0);
+        }
+    }
+
+    fn op_xce(&mut self) {
+        let carry = (self.p & Flags::C) != 0;
+        self.set_flag(Flags::C, self.mode == Mode::Emulation);
+        if carry {
+            self.mode = Mode::Emulation;
+            self.set_flag(Flags::X | Flags::M, true);
+            self.x[1] = 0;
+            self.y[1] = 0;
+            self.s[1] = 1;
+        } else {
+            self.mode = Mode::Native;
+        }
+    }
 }
 
 impl BusDevice for Cpu {
@@ -745,7 +1388,7 @@ impl BusDevice for Cpu {
         self.abort = false;
         self.nmi = false;
         self.irq = false;
-        self.mode == Mode::Emulation;
+        self.mode = Mode::Emulation;
     }
 
     fn tick<B: Bus>(&mut self, bus: &mut B) {
@@ -998,7 +1641,58 @@ impl BusDevice for Cpu {
             0xCE => self.op_dec(bus, Self::addr_abs),
             0xCF => self.op_cmp(bus, Self::addr_abl),
 
-            _ => todo!(),
+            0xD0 => self.op_bne(bus, Self::addr_imm8),
+            0xD1 => self.op_cmp(bus, Self::addr_idy),
+            0xD2 => self.op_cmp(bus, Self::addr_idp),
+            0xD3 => self.op_cmp(bus, Self::addr_isy),
+            0xD4 => self.op_pei(bus, Self::addr_idp),
+            0xD5 => self.op_cmp(bus, Self::addr_dpx),
+            0xD6 => self.op_dec(bus, Self::addr_dpx),
+            0xD7 => self.op_cmp(bus, Self::addr_ily),
+            0xD8 => self.op_cld(),
+            0xD9 => self.op_cmp(bus, Self::addr_aby),
+            0xDA => self.op_phx(bus),
+            0xDB => self.op_stp(),
+            0xDC => self.op_jmp(bus, Self::addr_ial),
+            0xDD => self.op_cmp(bus, Self::addr_abx),
+            0xDE => self.op_dec(bus, Self::addr_abx),
+            0xDF => self.op_cmp(bus, Self::addr_alx),
+
+            0xE0 if (self.p & Flags::X) == 0 => self.op_cpx(bus, Self::addr_imm16),
+            0xE0 => self.op_cpx(bus, Self::addr_imm8),
+            0xE1 => self.op_sbc(bus, Self::addr_idx),
+            0xE2 => self.op_sep(bus, Self::addr_imm8),
+            0xE3 => self.op_sbc(bus, Self::addr_sr),
+            0xE4 => self.op_cpy(bus, Self::addr_dp),
+            0xE5 => self.op_sbc(bus, Self::addr_dp),
+            0xE6 => self.op_inc(bus, Self::addr_dp),
+            0xE7 => self.op_sbc(bus, Self::addr_idl),
+            0xE8 => self.op_inx(),
+            0xE9 if (self.p & Flags::M) == 0 => self.op_sbc(bus, Self::addr_imm16),
+            0xE9 => self.op_sbc(bus, Self::addr_imm8),
+            0xEA => self.op_nop(),
+            0xEB => self.op_xba(),
+            0xEC => self.op_cpx(bus, Self::addr_abs),
+            0xED => self.op_sbc(bus, Self::addr_abs),
+            0xEE => self.op_inc(bus, Self::addr_abs),
+            0xEF => self.op_sbc(bus, Self::addr_abl),
+
+            0xF0 => self.op_beq(bus, Self::addr_imm8),
+            0xF1 => self.op_sbc(bus, Self::addr_idy),
+            0xF2 => self.op_sbc(bus, Self::addr_idp),
+            0xF3 => self.op_sbc(bus, Self::addr_isy),
+            0xF4 => self.op_pea(bus, Self::addr_abs),
+            0xF5 => self.op_sbc(bus, Self::addr_dpx),
+            0xF6 => self.op_inc(bus, Self::addr_dpx),
+            0xF7 => self.op_sbc(bus, Self::addr_ily),
+            0xF8 => self.op_sed(),
+            0xF9 => self.op_sbc(bus, Self::addr_aby),
+            0xFA => self.op_plx(bus),
+            0xFB => self.op_xce(),
+            0xFC => self.op_jsr(bus, Self::addr_iax),
+            0xFD => self.op_sbc(bus, Self::addr_abx),
+            0xFE => self.op_inc(bus, Self::addr_abx),
+            0xFF => self.op_sbc(bus, Self::addr_alx),
         };
     }
 }

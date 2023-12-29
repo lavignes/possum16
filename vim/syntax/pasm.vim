@@ -8,7 +8,7 @@ syn match pasmLocalLabel "^\.[a-z_][a-z0-9_]*"
 syn keyword pasmRegister x y s *
 
 syn match pasmOperator display "\%(+\|-\|/\|*\|\^\|\~\|&\||\|!\|>\|<\|%\)=\?"
-syn match pasmOperator display "&&\|||\|<<\|>>\|~>"
+syn match pasmOperator display "&&\|||\|<<\|>>\|\~>"
 
 syn keyword pasmOpcode adc and asl bcc bcs beq bit bmi bne bpl bra brk brl bvc bvs
 syn keyword pasmOpcode clc cld cli clv cmp cop cpx cpy dec dex dey eor inc inx iny

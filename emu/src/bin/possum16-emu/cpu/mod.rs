@@ -1,18 +1,18 @@
 use crate::bus::{Bus, BusDevice};
 
-enum Flags {}
+pub enum Flags {}
 
 impl Flags {
-    const C: u8 = 1 << 0; // carry
-    const E: u8 = 1 << 0; // 6502 emulation
-    const Z: u8 = 1 << 1; // zero
-    const I: u8 = 1 << 2; // interrupt 0=enabled 1=disable
-    const D: u8 = 1 << 3; // decimal
-    const B: u8 = 1 << 4; // break (only in emulation mode)
-    const X: u8 = 1 << 4; // 0=16-bit 1=8-bit index
-    const M: u8 = 1 << 5; // 0=16-bit 1=8-bit accumulator/memory
-    const V: u8 = 1 << 6; // overflow
-    const N: u8 = 1 << 7; // negative
+    pub const C: u8 = 1 << 0; // carry
+    pub const E: u8 = 1 << 0; // 6502 emulation
+    pub const Z: u8 = 1 << 1; // zero
+    pub const I: u8 = 1 << 2; // interrupt 0=enabled 1=disable
+    pub const D: u8 = 1 << 3; // decimal
+    pub const B: u8 = 1 << 4; // break (only in emulation mode)
+    pub const X: u8 = 1 << 4; // 0=16-bit 1=8-bit index
+    pub const M: u8 = 1 << 5; // 0=16-bit 1=8-bit accumulator/memory
+    pub const V: u8 = 1 << 6; // overflow
+    pub const N: u8 = 1 << 7; // negative
 }
 
 enum IntKind {
@@ -22,8 +22,8 @@ enum IntKind {
     Brk,
 }
 
-#[derive(PartialEq, Eq)]
-enum Mode {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
     Emulation,
     Native,
 }
@@ -55,6 +55,46 @@ pub struct Cpu {
 impl Cpu {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn c(&self) -> u16 {
+        u16::from_le_bytes(self.c)
+    }
+
+    pub fn x(&self) -> u16 {
+        u16::from_le_bytes(self.x)
+    }
+
+    pub fn y(&self) -> u16 {
+        u16::from_le_bytes(self.y)
+    }
+
+    pub fn s(&self) -> u16 {
+        u16::from_le_bytes(self.s)
+    }
+
+    pub fn pc(&self) -> u16 {
+        self.pc
+    }
+
+    pub fn d(&self) -> u16 {
+        self.d
+    }
+
+    pub fn dbr(&self) -> u8 {
+        self.dbr
+    }
+
+    pub fn pbr(&self) -> u8 {
+        self.pbr
+    }
+
+    pub fn p(&self) -> u8 {
+        self.p
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     fn push<B: Bus>(&mut self, bus: &mut B, data: u8) {

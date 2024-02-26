@@ -55,7 +55,7 @@ fn main() -> ExitCode {
 
 fn main_real() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let file = File::open(args.input).map_err(|e| format!("cannot open file: {e}"))?;
+    let file = File::open(args.input).map_err(|e| format!("cant open file: {e}"))?;
     let lexer = Lexer::new(file);
     let output: Box<dyn Write> = match args.output {
         Some(path) => Box::new(
@@ -64,12 +64,16 @@ fn main_real() -> Result<(), Box<dyn Error>> {
                 .create(true)
                 .truncate(true)
                 .open(path)
-                .map_err(|e| format!("cannot open file: {e}"))?,
+                .map_err(|e| format!("cant open file: {e}"))?,
         ),
         None => Box::new(io::stdout()),
     };
 
     let mut asm = Asm::new(lexer, output);
+    for (name, val) in &args.define {
+        let string = asm.str_int.intern(name);
+        asm.syms.push((Label::new(None, string), *val));
+    }
 
     eprint!("pass1: ");
     asm.pass()?;
@@ -222,7 +226,6 @@ impl<'a> Asm<'a> {
                             }
                             self.eat();
                         }
-                        self.eol()?;
                         self.toks.push(Box::new(MacroInvocation {
                             inner: mac,
                             line,
@@ -239,14 +242,12 @@ impl<'a> Asm<'a> {
                     } else {
                         Label::new(self.scope, string)
                     };
-                    self.eat(); // TODO: should go through code and only eat after
-                                // we check for possible errors to improve the errors
-                                // here we eat so the next error will report a bad location
+                    self.eat();
 
                     // being defined to a macro?
                     if (self.peek()? == Tok::IDENT) && self.str_like("MAC") {
                         if label.string.starts_with(".") {
-                            return Err(self.err("macro names must be global"));
+                            return Err(self.err("macro must be global"));
                         }
                         self.eat();
                         self.macrodef(label)?;
@@ -289,6 +290,7 @@ impl<'a> Asm<'a> {
                     }
                     // otherwise it is a pointer to the current PC
                     self.syms[index].1 = self.pc() as i32;
+                    continue;
                 }
                 // if this isn't a mnemonic or directive, then its an error
                 if mne.is_none() && dir.is_none() {
@@ -297,9 +299,8 @@ impl<'a> Asm<'a> {
                 // is this a directive
                 if let Some((dir, allow_dat)) = dir {
                     if self.dat_mode && !allow_dat {
-                        return Err(self.err("directive not allowed in dat mode"));
+                        return Err(self.err("not allowed in dat mode"));
                     }
-                    self.eat();
                     self.directive(*dir)?;
                     self.eol()?;
                     continue;
@@ -406,13 +407,13 @@ impl<'a> Asm<'a> {
     }
 
     fn const_expr(&self, expr: Option<i32>) -> io::Result<i32> {
-        expr.ok_or_else(|| self.err("expression cannot be resolved"))
+        expr.ok_or_else(|| self.err("expression unresolved"))
     }
 
     fn const_24(&self, expr: Option<i32>) -> io::Result<u32> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > 0x007FFFFFu32 {
-            return Err(self.err("expression too large to fit in 3 bytes"));
+            return Err(self.err("expression >3 bytes"));
         }
         Ok(expr as u32)
     }
@@ -420,7 +421,7 @@ impl<'a> Asm<'a> {
     fn const_16(&self, expr: Option<i32>) -> io::Result<u16> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > (u16::MAX as u32) {
-            return Err(self.err("expression too large to fit in 2 bytes"));
+            return Err(self.err("expression >2 bytes"));
         }
         Ok(expr as u16)
     }
@@ -428,7 +429,7 @@ impl<'a> Asm<'a> {
     fn const_8(&self, expr: Option<i32>) -> io::Result<u8> {
         let expr = self.const_expr(expr)?;
         if (expr as u32) > (u8::MAX as u32) {
-            return Err(self.err("expression too large to fit in 1 byte"));
+            return Err(self.err("expression >1 byte"));
         }
         Ok(expr as u8)
     }
@@ -513,64 +514,66 @@ impl<'a> Asm<'a> {
             match self.peek()? {
                 // star is multiply or the PC
                 Tok::STAR => {
-                    self.eat();
                     if !seen_val {
                         self.values.push(self.pc() as i32);
                         seen_val = true;
+                        self.eat();
                         continue;
                     }
                     self.expr_push_apply(Op::Binary(Tok::STAR));
                     seen_val = false;
+                    self.eat();
                     continue;
                 }
                 // these are optionally unary
                 tok @ (Tok::PLUS | Tok::MINUS | Tok::CARET | Tok::LT | Tok::GT) => {
-                    self.eat();
                     if seen_val {
                         self.expr_push_apply(Op::Binary(tok));
                     } else {
                         self.expr_push_apply(Op::Unary(tok));
                     }
+                    seen_val = false;
+                    self.eat();
                     continue;
                 }
                 // always unary
                 tok @ (Tok::BANG | Tok::TILDE) => {
-                    self.eat();
                     if !seen_val {
                         return Err(self.err("expected value"));
                     }
                     self.expr_push_apply(Op::Unary(tok));
                     seen_val = false;
+                    self.eat();
                     continue;
                 }
                 #[rustfmt::skip]
                 tok @ (Tok::PIPE | Tok::AND | Tok::OR | Tok::SOLIDUS | Tok::MODULUS | Tok::ASL
                       | Tok::ASR | Tok::LSR | Tok::LTE | Tok::GTE | Tok::EQ | Tok::NEQ) => {
-                    self.eat();
                     if !seen_val {
                         return Err(self.err("expected value"));
                     }
                     self.expr_push_apply(Op::Binary(tok));
                     seen_val = false;
+                    self.eat();
                     continue;
                 }
                 Tok::NUM => {
-                    self.eat();
                     if seen_val {
                         return Err(self.err("expected operator"));
                     }
                     self.values.push(self.tok().num());
                     seen_val = true;
+                    self.eat();
                     continue;
                 }
                 Tok::LPAREN => {
-                    self.eat();
                     if seen_val {
                         return Err(self.err("expected operator"));
                     }
                     paren_depth += 1;
                     self.operators.push(Op::Unary(Tok::LPAREN));
                     seen_val = false;
+                    self.eat();
                     continue;
                 }
                 Tok::RPAREN => {
@@ -578,7 +581,6 @@ impl<'a> Asm<'a> {
                     if self.operators.is_empty() && (paren_depth == 0) {
                         break;
                     }
-                    self.eat();
                     paren_depth -= 1;
                     if !seen_val {
                         return Err(self.err("expected value"));
@@ -597,6 +599,7 @@ impl<'a> Asm<'a> {
                             return Err(self.err("unbalanced parens"));
                         }
                     }
+                    self.eat();
                     continue;
                 }
                 Tok::IDENT => {
@@ -607,21 +610,21 @@ impl<'a> Asm<'a> {
                         Label::new(self.scope, string)
                     };
                     if let Some(sym) = self.syms.iter().find(|sym| &sym.0 == &label).copied() {
-                        self.eat();
                         if seen_val {
                             return Err(self.err("expected operator"));
                         }
                         self.values.push(sym.1);
                         seen_val = true;
+                        self.eat();
                         continue;
                     }
                     seen_unknown_label = true;
-                    self.eat();
                     if seen_val {
                         return Err(self.err("expected operator"));
                     }
                     self.values.push(1);
                     seen_val = true;
+                    self.eat();
                     continue;
                 }
                 _ => break,
@@ -669,7 +672,6 @@ impl<'a> Asm<'a> {
     fn operand(&mut self, mne: &(Mne, &[u8; 23])) -> io::Result<()> {
         match self.peek()? {
             Tok::NEWLINE => {
-                self.eat();
                 let op = self.check_opcode(mne.1, Addr::IMP)?;
                 if self.emit {
                     self.write(&[op])?;
@@ -677,7 +679,6 @@ impl<'a> Asm<'a> {
                 self.add_pc(1)
             }
             Tok::HASH => {
-                self.eat();
                 // TODO: I hate checking the mnemonic
                 // could use a table instead
                 #[rustfmt::skip]
@@ -689,6 +690,7 @@ impl<'a> Asm<'a> {
                     _ => 1,
                 };
                 let op = self.check_opcode(mne.1, Addr::IMM)?;
+                self.eat();
                 let expr = self.expr()?;
                 if self.emit {
                     self.write(&[op])?;
@@ -706,9 +708,10 @@ impl<'a> Asm<'a> {
                 // TODO: hate, but it makes it easy to know whether its an IAB or IAX
                 if let Mne::JMP | Mne::JSR = mne.0 {
                     let op = if self.peek()? == Tok::COMMA {
+                        let op = self.check_opcode(mne.1, Addr::IAX)?;
                         self.eat();
                         self.expect(Tok::X)?;
-                        self.check_opcode(mne.1, Addr::IAX)?
+                        op
                     } else {
                         self.check_opcode(mne.1, Addr::IAB)?
                     };
@@ -723,14 +726,16 @@ impl<'a> Asm<'a> {
                 if self.peek()? == Tok::COMMA {
                     self.eat();
                     let op = if self.peek()? == Tok::S {
+                        let op = self.check_opcode(mne.1, Addr::ISY)?;
                         self.eat();
                         self.expect(Tok::COMMA)?;
                         self.expect(Tok::Y)?;
-                        self.check_opcode(mne.1, Addr::ISY)?
+                        op
                     } else {
+                        let op = self.check_opcode(mne.1, Addr::IDX)?;
                         self.expect(Tok::COMMA)?;
                         self.expect(Tok::X)?;
-                        self.check_opcode(mne.1, Addr::IDX)?
+                        op
                     };
                     self.expect(Tok::RPAREN)?;
                     if self.emit {
@@ -742,9 +747,10 @@ impl<'a> Asm<'a> {
                 self.expect(Tok::RPAREN)?;
                 // IDP or IDY
                 let op = if self.peek()? == Tok::COMMA {
+                    let op = self.check_opcode(mne.1, Addr::IDY)?;
                     self.eat();
                     self.expect(Tok::Y)?;
-                    self.check_opcode(mne.1, Addr::IDY)?
+                    op
                 } else {
                     self.check_opcode(mne.1, Addr::IDP)?
                 };
@@ -759,9 +765,10 @@ impl<'a> Asm<'a> {
                 let expr = self.expr()?;
                 // TODO: hate, but it makes it easy to know whether its an IAL
                 if mne.0 == Mne::JML {
+                    let op = self.check_opcode(mne.1, Addr::IAL)?;
                     self.expect(Tok::RBRACK)?;
                     if self.emit {
-                        self.write(&self.check_opcode(mne.1, Addr::IAL)?.to_le_bytes())?;
+                        self.write(&[op])?;
                         self.write(&self.const_16(expr)?.to_le_bytes())?;
                     }
                     return self.add_pc(3);
@@ -769,9 +776,10 @@ impl<'a> Asm<'a> {
                 self.expect(Tok::RBRACK)?;
                 // IDL or ILY
                 let op = if self.peek()? == Tok::COMMA {
+                    let op = self.check_opcode(mne.1, Addr::ILY)?;
                     self.eat();
                     self.expect(Tok::Y)?;
-                    self.check_opcode(mne.1, Addr::ILY)?
+                    op
                 } else {
                     self.check_opcode(mne.1, Addr::IDL)?
                 };
@@ -820,9 +828,16 @@ impl<'a> Asm<'a> {
                     }
                     return self.add_pc(3);
                 }
+                // check for address width override
                 let width = match self.peek()? {
-                    Tok::PIPE => Width::ABS,
-                    Tok::ASP => Width::ABL,
+                    Tok::PIPE => {
+                        self.eat();
+                        Width::ABS
+                    }
+                    Tok::ASP => {
+                        self.eat();
+                        Width::ABL
+                    }
                     _ => Width::DP,
                 };
                 let expr = self.expr()?;
@@ -833,63 +848,62 @@ impl<'a> Asm<'a> {
                         match self.peek()? {
                             Tok::S => {
                                 self.eat();
+                                let op = self.check_opcode(mne.1, Addr::SR)?;
                                 if self.emit {
-                                    self.write(&self.check_opcode(mne.1, Addr::SR)?.to_le_bytes())?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_8(expr)?.to_le_bytes())?;
                                 }
                                 self.add_pc(2)
                             }
                             Tok::X => {
-                                self.eat();
                                 // try promoting up
                                 if let Some(val) = expr {
                                     if (val as u32) > (u16::MAX as u32) {
+                                        let op = self.check_opcode(mne.1, Addr::ALX)?;
                                         if self.emit {
-                                            self.write(
-                                                &self.check_opcode(mne.1, Addr::ALX)?.to_le_bytes(),
-                                            )?;
+                                            self.write(&[op])?;
                                             self.write(&self.const_24(expr)?.to_le_bytes())?;
                                         }
+                                        self.eat();
                                         return self.add_pc(4);
                                     }
                                     if (val as u32) > (u8::MAX as u32) {
+                                        let op = self.check_opcode(mne.1, Addr::ABX)?;
                                         if self.emit {
-                                            self.write(
-                                                &self.check_opcode(mne.1, Addr::ABX)?.to_le_bytes(),
-                                            )?;
+                                            self.write(&[op])?;
                                             self.write(&self.const_16(expr)?.to_le_bytes())?;
                                         }
+                                        self.eat();
                                         return self.add_pc(3);
                                     }
                                 }
+                                let op = self.check_opcode(mne.1, Addr::DPX)?;
                                 if self.emit {
-                                    self.write(
-                                        &self.check_opcode(mne.1, Addr::DPX)?.to_le_bytes(),
-                                    )?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_8(expr)?.to_le_bytes())?;
                                 }
+                                self.eat();
                                 self.add_pc(2)
                             }
                             Tok::Y => {
-                                self.eat();
                                 // try promoting up
                                 if let Some(val) = expr {
                                     if (val as u32) > (u8::MAX as u32) {
+                                        let op = self.check_opcode(mne.1, Addr::ABY)?;
                                         if self.emit {
-                                            self.write(
-                                                &self.check_opcode(mne.1, Addr::ABY)?.to_le_bytes(),
-                                            )?;
+                                            self.write(&[op])?;
                                             self.write(&self.const_16(expr)?.to_le_bytes())?;
                                         }
+                                        self.eat();
                                         return self.add_pc(3);
                                     }
                                 }
+                                let op = self.check_opcode(mne.1, Addr::DPY)?;
                                 if self.emit {
-                                    self.write(
-                                        &self.check_opcode(mne.1, Addr::DPY)?.to_le_bytes(),
-                                    )?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_8(expr)?.to_le_bytes())?;
                                 }
+                                self.eat();
                                 self.add_pc(2)
                             }
                             _ => Err(self.err("illegal address mode")),
@@ -897,30 +911,28 @@ impl<'a> Asm<'a> {
                     }
                     // DP
                     (Width::DP, _) => {
-                        self.eat();
                         // try promoting up
                         if let Some(val) = expr {
                             if (val as u32) > (u16::MAX as u32) {
+                                let op = self.check_opcode(mne.1, Addr::ABL)?;
                                 if self.emit {
-                                    self.write(
-                                        &self.check_opcode(mne.1, Addr::ABL)?.to_le_bytes(),
-                                    )?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_24(expr)?.to_le_bytes())?;
                                 }
                                 return self.add_pc(4);
                             }
                             if (val as u32) > (u8::MAX as u32) {
+                                let op = self.check_opcode(mne.1, Addr::ABS)?;
                                 if self.emit {
-                                    self.write(
-                                        &self.check_opcode(mne.1, Addr::ABS)?.to_le_bytes(),
-                                    )?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_16(expr)?.to_le_bytes())?;
                                 }
                                 return self.add_pc(3);
                             }
                         }
+                        let op = self.check_opcode(mne.1, Addr::DP)?;
                         if self.emit {
-                            self.write(&self.check_opcode(mne.1, Addr::DP)?.to_le_bytes())?;
+                            self.write(&[op])?;
                             self.write(&self.const_8(expr)?.to_le_bytes())?;
                         }
                         self.add_pc(2)
@@ -930,35 +942,33 @@ impl<'a> Asm<'a> {
                         self.eat();
                         match self.peek()? {
                             Tok::X => {
-                                self.eat();
                                 // try promoting up
                                 if let Some(val) = expr {
                                     if (val as u32) > (u16::MAX as u32) {
+                                        let op = self.check_opcode(mne.1, Addr::ALX)?;
                                         if self.emit {
-                                            self.write(
-                                                &self.check_opcode(mne.1, Addr::ALX)?.to_le_bytes(),
-                                            )?;
+                                            self.write(&[op])?;
                                             self.write(&self.const_24(expr)?.to_le_bytes())?;
                                         }
+                                        self.eat();
                                         return self.add_pc(4);
                                     }
                                 }
+                                let op = self.check_opcode(mne.1, Addr::ABX)?;
                                 if self.emit {
-                                    self.write(
-                                        &self.check_opcode(mne.1, Addr::ABX)?.to_le_bytes(),
-                                    )?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_16(expr)?.to_le_bytes())?;
                                 }
+                                self.eat();
                                 self.add_pc(3)
                             }
                             Tok::Y => {
-                                self.eat();
+                                let op = self.check_opcode(mne.1, Addr::ABY)?;
                                 if self.emit {
-                                    self.write(
-                                        &self.check_opcode(mne.1, Addr::ABY)?.to_le_bytes(),
-                                    )?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_16(expr)?.to_le_bytes())?;
                                 }
+                                self.eat();
                                 self.add_pc(3)
                             }
                             _ => Err(self.err("illegal address mode")),
@@ -966,39 +976,39 @@ impl<'a> Asm<'a> {
                     }
                     // ABS
                     (Width::ABS, _) => {
-                        self.eat();
                         // try promoting up
                         if let Some(val) = expr {
                             if (val as u32) > (u16::MAX as u32) {
+                                let op = self.check_opcode(mne.1, Addr::ABL)?;
                                 if self.emit {
-                                    self.write(
-                                        &self.check_opcode(mne.1, Addr::ABL)?.to_le_bytes(),
-                                    )?;
+                                    self.write(&[op])?;
                                     self.write(&self.const_24(expr)?.to_le_bytes())?;
                                 }
                                 return self.add_pc(4);
                             }
                         }
+                        let op = self.check_opcode(mne.1, Addr::ABS)?;
                         if self.emit {
-                            self.write(&self.check_opcode(mne.1, Addr::ABS)?.to_le_bytes())?;
+                            self.write(&[op])?;
                             self.write(&self.const_16(expr)?.to_le_bytes())?;
                         }
                         self.add_pc(3)
                     }
                     // ALX
                     (Width::ABL, Tok::X) => {
-                        self.eat();
+                        let op = self.check_opcode(mne.1, Addr::ALX)?;
                         if self.emit {
-                            self.write(&self.check_opcode(mne.1, Addr::ALX)?.to_le_bytes())?;
+                            self.write(&[op])?;
                             self.write(&self.const_16(expr)?.to_le_bytes())?;
                         }
+                        self.eat();
                         self.add_pc(3)
                     }
                     // ABL
                     (Width::ABL, _) => {
-                        self.eat();
+                        let op = self.check_opcode(mne.1, Addr::ABL)?;
                         if self.emit {
-                            self.write(&self.check_opcode(mne.1, Addr::ABL)?.to_le_bytes())?;
+                            self.write(&[op])?;
                             self.write(&self.const_24(expr)?.to_le_bytes())?;
                         }
                         self.add_pc(4)
@@ -1011,6 +1021,7 @@ impl<'a> Asm<'a> {
     fn directive(&mut self, dir: Dir) -> io::Result<()> {
         match dir {
             Dir::BYT => loop {
+                self.eat();
                 if self.peek()? == Tok::STR {
                     if self.emit {
                         self.write_str()?;
@@ -1030,6 +1041,7 @@ impl<'a> Asm<'a> {
                 self.eat();
             },
             Dir::WRD => loop {
+                self.eat();
                 let expr = self.expr()?;
                 if self.emit {
                     self.write(&self.const_16(expr)?.to_le_bytes())?;
@@ -1041,12 +1053,15 @@ impl<'a> Asm<'a> {
                 self.eat();
             },
             Dir::DAT => {
+                self.eat();
                 self.dat_mode = true;
             }
             Dir::PRG => {
+                self.eat();
                 self.dat_mode = false;
             }
             Dir::PAD => {
+                self.eat();
                 let expr = self.expr()?;
                 let pad = self.const_24(expr)?;
                 if self.emit && !self.dat_mode {
@@ -1057,6 +1072,7 @@ impl<'a> Asm<'a> {
                 self.add_pc(pad)?;
             }
             Dir::ADJ => {
+                self.eat();
                 let expr = self.expr()?;
                 let adj = self.pc() % self.const_24(expr)?;
                 if self.emit {
@@ -1067,6 +1083,7 @@ impl<'a> Asm<'a> {
                 self.add_pc(adj)?;
             }
             Dir::PUT => {
+                self.eat();
                 if self.peek()? != Tok::STR {
                     return Err(self.err("expected file name"));
                 }
@@ -1076,6 +1093,7 @@ impl<'a> Asm<'a> {
                 self.toks.push(Box::new(lexer));
             }
             Dir::IFF | Dir::IFD | Dir::IFN => {
+                self.eat();
                 let expr = self.expr()?;
                 let skip = match dir {
                     Dir::IFF => self.const_expr(expr)? == 0,
@@ -1110,24 +1128,31 @@ impl<'a> Asm<'a> {
                 if self.if_level == 0 {
                     return Err(self.err("unexpected end"));
                 }
+                self.eat();
                 self.if_level -= 1;
             }
             Dir::I08 => {
+                self.eat();
                 self.index_16 = false;
             }
             Dir::I16 => {
+                self.eat();
                 self.index_16 = true;
             }
             Dir::A08 => {
+                self.eat();
                 self.accum_16 = false;
             }
             Dir::A16 => {
+                self.eat();
                 self.accum_16 = true;
             }
             Dir::C02 => {
+                self.eat();
                 self.c16_mode = false;
             }
             Dir::C16 => {
+                self.eat();
                 self.c16_mode = true;
             }
             _ => unreachable!(),
@@ -1657,7 +1682,7 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
                 Ok(Tok::EOF)
             }
             // macro argument
-            Some(b'?') => {
+            Some(b'\\') => {
                 self.reader.eat();
                 while let Some(c) = self.reader.peek()? {
                     if !c.is_ascii_digit() {
@@ -1668,6 +1693,9 @@ impl<R: Read + Seek> TokStream for Lexer<R> {
                 }
                 self.number =
                     i32::from_str_radix(&self.string, 10).map_err(|e| self.err(&e.to_string()))?;
+                if self.number < 1 {
+                    return Err(self.err("argument must be positive"));
+                }
                 self.stash = Some(Tok::ARG);
                 Ok(Tok::ARG)
             }
@@ -1836,7 +1864,7 @@ impl<'a> TokStream for MacroInvocation<'a> {
             MacroTok::Ident(_) => Ok(Tok::IDENT),
             MacroTok::Num(_) => Ok(Tok::NUM),
             MacroTok::Arg(index) => {
-                if index > self.args.len() {
+                if index >= self.args.len() {
                     return Err(self.err("argument is undefined"));
                 }
                 match self.args[index] {

@@ -4,9 +4,10 @@ use crate::{
     bus::{Bus, BusDevice},
     cpu::Cpu,
     uart::Uart,
+    vdp::Vdp,
 };
 
-struct Mem {
+pub struct Mem {
     inner: Vec<u8>,
 }
 
@@ -28,6 +29,7 @@ impl Mem {
 
 pub struct Sys<S0> {
     cpu: Cpu,
+    vdp: Vdp,
     ser0: Uart<S0>,
     mem: Mem,
     irq_latch: u8,

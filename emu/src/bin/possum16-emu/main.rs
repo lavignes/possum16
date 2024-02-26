@@ -11,6 +11,7 @@ use std::{
 };
 
 use clap::Parser;
+use cpu::{Cpu, Flags, Mode};
 use signal_hook::{consts, flag};
 use sys::Sys;
 use termion::{
@@ -23,6 +24,7 @@ mod bus;
 mod cpu;
 mod sys;
 mod uart;
+mod vdp;
 
 struct Tty {
     tx: RawTerminal<Stdout>,
@@ -149,6 +151,7 @@ fn main_real(args: &Args) -> Result<(), impl Into<Box<dyn Error>>> {
                             // single step
                             sys.tick();
                         }
+                        "r" => print_regs(sys.cpu()),
                         _ => println!("unknown command: `{}`. type `?` for help", parts[0]),
                     }
                 }
@@ -160,4 +163,31 @@ fn main_real(args: &Args) -> Result<(), impl Into<Box<dyn Error>>> {
         sys.tick();
     }
     Ok(())
+}
+
+fn print_regs(cpu: &Cpu) {
+    print!(
+        "C={:04X} X={:04X} Y={:04X} S={:04X} PC={:04X} D={:02X} PBR={:02X} DBR={:02X} P=[",
+        cpu.c(),
+        cpu.x(),
+        cpu.y(),
+        cpu.s(),
+        cpu.pc(),
+        cpu.d(),
+        cpu.pbr(),
+        cpu.dbr(),
+    );
+    print!("{}", if (cpu.p() & Flags::N) != 0 { 'N' } else { 'n' });
+    print!("{}", if (cpu.p() & Flags::V) != 0 { 'V' } else { 'v' });
+    print!("{}", if (cpu.p() & Flags::M) != 0 { 'M' } else { 'm' });
+    if cpu.mode() == Mode::Emulation {
+        print!("{}", if (cpu.p() & Flags::B) != 0 { 'B' } else { 'b' });
+    } else {
+        print!("{}", if (cpu.p() & Flags::X) != 0 { 'X' } else { 'x' });
+    }
+    print!("{}", if (cpu.p() & Flags::D) != 0 { 'D' } else { 'd' });
+    print!("{}", if (cpu.p() & Flags::I) != 0 { 'I' } else { 'i' });
+    print!("{}", if (cpu.p() & Flags::Z) != 0 { 'Z' } else { 'z' });
+    print!("{}", if (cpu.p() & Flags::C) != 0 { 'C' } else { 'c' });
+    println!("]");
 }

@@ -41,6 +41,7 @@ where
 {
     pub fn new(rom: &[u8], ser0: S0) -> Self {
         let cpu = Cpu::new();
+        let vdp = Vdp::new();
         let ser0 = Uart::new(ser0);
         let mut mem = Mem::new();
         for (i, data) in rom.iter().enumerate() {
@@ -48,6 +49,7 @@ where
         }
         Self {
             cpu,
+            vdp,
             ser0,
             mem,
             irq_latch: 0,
@@ -57,6 +59,7 @@ where
     pub fn reset(&mut self) {
         let Self {
             ref mut cpu,
+            ref mut vdp,
             ref mut ser0,
             ref mut mem,
             ref mut irq_latch,
@@ -69,6 +72,7 @@ where
     pub fn tick(&mut self) {
         let Self {
             ref mut cpu,
+            ref mut vdp,
             ref mut ser0,
             ref mut mem,
             ref mut irq_latch,

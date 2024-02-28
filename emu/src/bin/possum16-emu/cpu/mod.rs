@@ -627,7 +627,19 @@ impl Cpu {
     }
 
     fn op_mvp<B: Bus>(&mut self, bus: &mut B) {
-        todo!();
+        let count = u16::from_le_bytes(self.c);
+        let dst_bank = self.fetch(bus);
+        let src_bank = self.fetch(bus);
+        let mut src = u16::from_le_bytes(self.x);
+        let mut dst = u16::from_le_bytes(self.y);
+        for _ in 0..count {
+            let data = self.read(((src_bank as u32) << 16) | (src as u32));
+            self.write(((dst_bank as u32) << 16) | (dst as u32), data);
+            src = src.wrapping_add(1);
+            dst = dst.wrapping_add(1);
+        }
+        self.c = [0xFF, 0xFF];
+        self.dbr = dst_bank;
     }
 
     fn op_lsr<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
@@ -696,7 +708,19 @@ impl Cpu {
     }
 
     fn op_mvn<B: Bus>(&mut self, bus: &mut B) {
-        todo!();
+        let count = u16::from_le_bytes(self.c);
+        let dst_bank = self.fetch(bus);
+        let src_bank = self.fetch(bus);
+        let mut src = u16::from_le_bytes(self.x);
+        let mut dst = u16::from_le_bytes(self.y);
+        for _ in 0..count {
+            let data = self.read(((src_bank as u32) << 16) | (src as u32));
+            self.write(((dst_bank as u32) << 16) | (dst as u32), data);
+            src = src.wrapping_sub(1);
+            dst = dst.wrapping_sub(1);
+        }
+        self.c = [0xFF, 0xFF];
+        self.dbr = dst_bank;
     }
 
     fn op_cli(&mut self) {

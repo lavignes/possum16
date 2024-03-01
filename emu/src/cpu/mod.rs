@@ -47,8 +47,11 @@ pub struct Cpu {
     p: u8,      // processor status
 
     abort: bool,
+    wait: bool,
+    stop: bool,
     nmi: bool,
     irq: bool,
+    brk: bool,
     mode: Mode,
 }
 
@@ -302,7 +305,7 @@ impl Cpu {
     }
 
     fn op_brk<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
-        todo!();
+        self.brk = true;
     }
 
     fn op_ora<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
@@ -1253,7 +1256,7 @@ impl Cpu {
     }
 
     fn op_wai(&mut self) {
-        todo!();
+        self.wait = true;
     }
 
     fn op_bne<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
@@ -1265,7 +1268,9 @@ impl Cpu {
     }
 
     fn op_pei<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
-        todo!();
+        let addr = ea(self, bus);
+        self.push(bus, (addr >> 8) as u8);
+        self.push(bus, addr as u8);
     }
 
     fn op_cld(&mut self) {
@@ -1282,7 +1287,7 @@ impl Cpu {
     }
 
     fn op_stp(&mut self) {
-        todo!();
+        self.stop = true;
     }
 
     fn op_cpx<B: Bus, A: Fn(&mut Self, &mut B) -> u32>(&mut self, bus: &mut B, ea: A) {
@@ -1450,29 +1455,47 @@ impl BusDevice for Cpu {
         self.pbr = 0;
         self.p = Flags::M | Flags::X | Flags::I | Flags::E;
         self.abort = false;
+        self.wait = false;
+        self.stop = false;
         self.nmi = false;
         self.irq = false;
+        self.brk = false;
         self.mode = Mode::Emulation;
     }
 
     fn tick<B: Bus>(&mut self, bus: &mut B) {
-        /*
+        if self.stop {
+            return;
+        }
         if self.abort {
             self.abort = false;
+            self.wait = false;
             self.interrupt(bus, IntKind::Abrt);
             return;
         }
         if self.nmi {
             self.nmi = false;
+            self.wait = false;
             self.interrupt(bus, IntKind::Nmi);
             return;
         }
-        if self.irq && ((self.p & Flags::I) == 0) {
-            self.irq = false;
-            self.interrupt(bus, IntKind::Irq);
+        if (self.p & Flags::I) == 0 {
+            if self.irq {
+                self.irq = false;
+                self.wait = false;
+                self.interrupt(bus, IntKind::Irq);
+                return;
+            }
+            if self.brk {
+                self.brk = false;
+                self.wait = false;
+                self.interrupt(bus, IntKind::Brk);
+                return;
+            }
+        }
+        if self.wait {
             return;
         }
-        */
         match self.fetch(bus) {
             0x00 => self.op_brk(bus, Self::addr_imm8),
             0x01 => self.op_ora(bus, Self::addr_idx),

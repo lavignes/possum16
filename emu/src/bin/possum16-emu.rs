@@ -11,20 +11,16 @@ use std::{
 };
 
 use clap::Parser;
-use cpu::{Cpu, Flags, Mode};
+use possum16::{
+    cpu::{Cpu, Flags, Mode},
+    sys::Sys,
+};
 use signal_hook::{consts, flag};
-use sys::Sys;
 use termion::{
     raw::{IntoRawMode, RawTerminal},
     AsyncReader,
 };
 use tracing::Level;
-
-mod bus;
-mod cpu;
-mod sys;
-mod uart;
-mod vdp;
 
 struct Tty {
     tx: RawTerminal<Stdout>,
@@ -117,7 +113,8 @@ fn main_real(args: &Args) -> Result<(), impl Into<Box<dyn Error>>> {
             sys.ser0_mut().handle_mut().tx.suspend_raw_mode().unwrap();
             let mut cached_parts = Vec::new();
             loop {
-                print!("dbg>");
+                print_regs(sys.cpu());
+                print!(">");
                 sys.ser0_mut().handle_mut().tx.flush().unwrap();
                 let mut line = Vec::new();
                 // kind of jank, but reads are async, so we busy-wait
@@ -151,7 +148,6 @@ fn main_real(args: &Args) -> Result<(), impl Into<Box<dyn Error>>> {
                             // single step
                             sys.tick();
                         }
-                        "r" => print_regs(sys.cpu()),
                         _ => println!("unknown command: `{}`. type `?` for help", parts[0]),
                     }
                 }
